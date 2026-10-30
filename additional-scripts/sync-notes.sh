@@ -1280,6 +1280,15 @@ function pkg_install
     install_packages $pkgfile
 end
 
+# term_cols : width of the terminal (80 when unknown)
+function term_cols
+    set -l c $COLUMNS
+    string match -qr '^[0-9]+$' -- "$c"; or set c (stty size </dev/tty 2>/dev/null | string split ' ')[2]
+    string match -qr '^[0-9]+$' -- "$c"; or set c 80
+    test $c -lt 40; and set c 40
+    echo $c
+end
+
 # ================================================================ folders
 # Everything tracked is saved in the notes under the same path it has in your home folder:
 #   Backup/<path>                     restored on every machine   (~/Downloads/clean.py -> Backup/Downloads/clean.py)
@@ -1360,7 +1369,7 @@ function build_dir_items
         set -a wheres $where
         set -a ostrs "$ostr$mark"
 
-        # column widths follow the longest entry (a very long one does not stretch the table)
+         # column widths follow the longest entry (a very long one does not stretch the table)
         set -l l (string length -- $shown)
         test $l -gt $wn -a $l -le 32; and set wn $l
         set l (string length -- $pshow)
@@ -1368,10 +1377,44 @@ function build_dir_items
         set l (string length -- $where)
         test $l -gt $ww; and set ww $l
     end
+
+    # fit the terminal: 7 characters go to the "  12) " prefix, 6 to the gaps between columns.
+    # Shrink OPTIONS first, then PATH, NAME and WHERE, never below a minimum.
+    set -l avail (math (term_cols) - 13)
+    set -l wo 7
+    for o in $ostrs
+        set -l len (string length -- $o)
+        test $len -gt $wo; and set wo $len
+    end
+    set -l over (math $wn + $wp + $ww + $wo - $avail)
+    set -l cut (math "min($over, $wo - 10)")
+    if test $cut -gt 0
+        set wo (math $wo - $cut)
+        set over (math $over - $cut)
+    end
+    set cut (math "min($over, $wp - 12)")
+    if test $cut -gt 0
+        set wp (math $wp - $cut)
+        set over (math $over - $cut)
+    end
+    set cut (math "min($over, $wn - 10)")
+    if test $cut -gt 0
+        set wn (math $wn - $cut)
+        set over (math $over - $cut)
+    end
+    set cut (math "min($over, $ww - 12)")
+    if test $cut -gt 0
+        set ww (math $ww - $cut)
+    end
+
     set -l fmt "%-"$wn"s  %-"$wp"s  %-"$ww"s  %s"
     set -g items_header (printf $fmt NAME PATH WHERE OPTIONS)
     for i in (seq (count $items_key))
-        set -a items_label (printf $fmt $items_shown[$i] $items_pshow[$i] $wheres[$i] "$ostrs[$i]")
+        set -a items_label (printf $fmt \
+            "$(string shorten -m $wn -- $items_shown[$i])" \
+            "$(string shorten -l -m $wp -- $items_pshow[$i])" \
+            "$(string shorten -m $ww -- $wheres[$i])" \
+            "$(string shorten -m $wo -- $ostrs[$i])")
     end
 end
 
@@ -1400,7 +1443,14 @@ set -g tree_cut 0
 function tree_walk
     set -l dir $argv[1]
     set -l prefix $argv[2]
-    set -l items (command ls -A -- $dir 2>/dev/null)
+    set -l items
+    for x in (command ls -A -- $dir 2>/dev/null)
+        set -l skip 0
+        for e in $gi_excl
+            string match -q -- "*/$e" "$dir/$x"; and set skip 1
+        end
+        test $skip -eq 0; and set -a items $x
+    end
     set -l n (count $items)
     for i in (seq $n)
         if test $tree_lines -ge $tree_max
@@ -1440,6 +1490,7 @@ end
 
 function tree_show
     set -l dir $argv[1]
+    test -d $dir -a ! -L $dir; or return 0 
     set -g tree_lines 0
     set -g tree_cut 0
     echo
@@ -1448,7 +1499,7 @@ function tree_show
     set_color normal
     tree_walk $dir ""
     if test $tree_cut -eq 1
-        echo "  ... stopped after $tree_max lines ("(find $dir -mindepth 1 | count)" items in all)"
+        echo "  ... stopped after $tree_max lines ("(find $dir -mindepth 1 $gi_xf | count)" items in all)"
     end
     test $tree_lines -eq 0; and echo "  (empty)"
     return 0
@@ -1470,9 +1521,10 @@ function gi_whole
     set -l p $argv[1]
     set -l name $argv[2]
     set -l ig "/"(gi_esc $name)"/"
+    gitignore_drop_folder $name
     gitignore_add $ig
     info "git will ignore $ig (the whole folder)"
-    echo "  "(find $p -mindepth 1 | count)" items inside, all of them ignored by git"
+    echo "  "(find $p -mindepth 1 $gi_xf | count)" items inside, all of them ignored by git"
     # already committed earlier? stop tracking it (files stay on disk)
     if test -d $notes/.git; and git -C $notes ls-files --error-unmatch -- $name >/dev/null 2>&1
         git -C $notes rm -r -q --cached -- $name
@@ -1492,11 +1544,161 @@ function gi_find
         set pat "*$argv[2]*"
         set how -iname
     end
-    find $p -mindepth 1 -not -path '*/.git/*' $how $pat -printf '%P\n' | sort
+    find $p -mindepth 1 -not -path '*/.git/*' $gi_xf $how $pat -printf '%P\n' | sort
 end
 
-# gi_resolve P T REL : find out which path(s) inside the folder P the user means by REL (T is what
-# they typed, REL the same relative to the folder). Sets the global $gi_picked (paths from P).
+# gi_split REPLY P : the words of an answer, one per line. With a comma the commas split; without one the
+# spaces do, unless the whole answer is the name of something inside the folder P (a file called
+# "Pokemon - HeartGold Version (USA).nds" stays one word).
+function gi_split
+    set -l r (string trim -- $argv[1])
+    test -n "$r"; or return 0
+    if test -n "$argv[2]"; and string match -q '* *' -- $r; and begin; test -e "$argv[2]/$r"; or test (gi_find $argv[2] $r exact | count) -gt 0; end
+        echo $r
+    else if string match -qr '(^|[\s,])[\x27\x22]' -- $r
+        string match -ar -- '\x27[^\x27]*\x27|\x22[^\x22]*\x22|[^\s,]+' $r
+    else if string match -q '*,*' -- $r
+        string split -n , -- $r
+    else
+        string split -n ' ' -- $r
+    end
+end
+
+# gi_rel P T : what T (typed by the user) means as a path from the folder P. Nothing, status 1, when it is
+# not inside P.
+function gi_rel
+    set -l p $argv[1]
+    set -l t (string trim -- $argv[2])
+    set t (string trim -c "'\"" -- $t)
+    test -n "$t"; or return 1
+    set -l rel (string replace -r -- '^~' "$HOME" $t)
+    if string match -q -- "$p/*" $rel
+        set rel (string sub -s (math (string length -- "$p/") + 1) -- $rel)
+    end
+    set rel (string replace -r -- '^(\./)+' '' $rel)
+    set rel (string trim -r -c / -- $rel)
+    test -n "$rel"; or return 1
+    string match -q -- '/*' $rel; and return 1
+    string match -qr '(^|/)\.\.(/|$)' -- $rel; and return 1
+    echo $rel
+end
+
+# gi_under REL DIR... : REL sits inside one of the DIRs ("." = the whole tracked folder). Prints the deepest one.
+function gi_under
+    set -l rel $argv[1]
+    set -e argv[1]
+    set -l best ""
+    set -l bl -1
+    for d in $argv
+        set -l cl (string length -- $d)
+        test "$d" = .; and set cl 0
+        if test "$d" = .; or string match -q -- "$d/*" $rel
+            if test $cl -gt $bl
+                set best $d
+                set bl $cl
+            end
+        end
+    end
+    test $bl -ge 0; or return 1
+    echo $best
+end
+
+# gi_keep_lines P BASE DIR KEEP... : the .gitignore lines that leave DIR out of git except the KEEP paths
+# (paths from the tracked folder P, all inside DIR; DIR "." = the whole folder). A folder that is ignored
+# as a whole cannot have anything inside it brought back, so it is ignored by its contents (DIR/*) and
+# every folder on the way to a kept path is let through first (!DIR/a/ then DIR/a/*).
+function gi_keep_lines
+    set -l p $argv[1]
+    set -l base $argv[2]
+    set -l dir $argv[3]
+    set -e argv[1 2 3]
+    if test "$dir" = .
+        echo "$base/*"
+    else
+        echo "$base/"(gi_esc $dir)"/*"
+    end
+    for k in $argv
+        set -l rest $k
+        test "$dir" != .; and set rest (string sub -s (math (string length -- "$dir/") + 1) -- $k)
+        set -l parts (string split / -- $rest)
+        set -l acc ""
+        test "$dir" != .; and set acc $dir
+        for i in (seq (math (count $parts) - 1))
+            if test -n "$acc"
+                set acc "$acc/$parts[$i]"
+            else
+                set acc $parts[$i]
+            end
+            echo "!$base/"(gi_esc $acc)"/"
+            echo "$base/"(gi_esc $acc)"/*"
+        end
+        if test -d $p/$k -a ! -L $p/$k
+            echo "!$base/"(gi_esc $k)"/"
+        else
+            echo "!$base/"(gi_esc $k)
+        end
+    end
+end
+
+# gitignore_drop_folder NAME : remove the .gitignore lines of the tracked folder NAME (e.g. Backup/Games): the
+# line /NAME, /NAME/..., and the ! lines under it. Lines of another tracked entry nested inside it
+# (Backup/Games/Roms) and comments are left alone.
+function gitignore_drop_folder
+    set -l gi $notes/.gitignore
+    test -f $gi; or return 0
+    set -l base "/"(gi_esc $argv[1])
+    set -l nested
+    for line in (tracked_list $dirfile)
+        set -l t (string split \t -- $line)
+        string match -q -- "$argv[1]/*" $t[2]; and set -a nested "/"(gi_esc $t[2])
+    end
+    set -l out
+    set -l dropped 0
+    for l in (cat $gi)
+        set -l body (string trim -- "$l")
+        string match -q -- '!*' "$body"; and set body (string sub -s 2 -- "$body")
+        set -l mine 0
+        if test "$body" = "$base"; or string match -q -- "$base/*" "$body"
+            set mine 1
+            for nb in $nested
+                if test "$body" = "$nb"; or string match -q -- "$nb/*" "$body"
+                    set mine 0
+                end
+            end
+        end
+        if test $mine -eq 1
+            set dropped (math $dropped + 1)
+        else
+            set -a out "$l"
+        end
+    end
+    test $dropped -gt 0; or return 0
+    if test (count $out) -gt 0
+        printf '%s\n' $out >$gi.tmp
+    else
+        true >$gi.tmp
+    end
+    mv $gi.tmp $gi
+    info ".gitignore: removed $dropped old rule(s) for $argv[1] (replaced by your new answer)"
+end
+
+# gitignore_remove LINE : take that exact line out of $notes/.gitignore
+function gitignore_remove
+    set -l gi $notes/.gitignore
+    test -f $gi; or return 0
+    grep -vxF -- $argv[1] $gi >$gi.tmp
+    mv $gi.tmp $gi
+    return 0
+end
+
+# gi_ext_hits P EXT : the files (paths from P) of that type, any depth, one per line. .git is left out.
+function gi_ext_hits
+    find $argv[1] -not -path '*/.git/*' $gi_xf \( -type f -o -type l \) -iname "*.$argv[2]" -printf '%P\n' | sort
+end
+
+# gi_resolve P T REL [VERB] : find out which path(s) inside the folder P the user means by REL (T is what
+# they typed, REL the same relative to the folder). Sets the global $gi_picked (paths from P) and
+# $gi_unpicked (matches that were listed but not picked).
 #   - a path that exists (data/cache.db) is taken as it is
 #   - a name is searched for anywhere under P: one hit is used, several are listed to pick from
 #   - when nothing has that exact name, files and folders with a similar name are offered
@@ -1505,8 +1707,11 @@ function gi_resolve
     set -l p $argv[1]
     set -l t $argv[2]
     set -l rel $argv[3]
+    set -l act "NOT track"
+    set -q argv[4]; and set act "KEEP tracking"
     set -l shown (string replace -- "$HOME/" '~/' $p)
     set -g gi_picked
+    set -g gi_unpicked
 
     if string match -q '*/*' -- $rel; and test -e $p/$rel -o -L $p/$rel
         set -g gi_picked $rel
@@ -1515,46 +1720,131 @@ function gi_resolve
 
     set -l name (string replace -r -- '^.*/' '' $rel)
     set -l hits (gi_find $p $name exact)
+    set -l n_exact (count $hits)
+
+    # other names that only CONTAIN the word (test -> test_subject.sav) are offered too
+    set -l similar
+    if not string match -q '*/*' -- $rel; and not string match -qr '[*?\[]' -- $name
+        for s in (gi_find $p $name partial)
+            contains -- $s $hits; or set -a similar $s
+        end
+    end
+
     set -l head ""
     if string match -q '*/*' -- $rel
-        test (count $hits) -gt 0; and set head "'$t' is not there, but '$name' exists elsewhere in $shown:"
-    else if test (count $hits) -eq 1
+        test $n_exact -gt 0; and set head "'$t' is not there, but '$name' exists elsewhere in $shown:"
+    else if test $n_exact -eq 1 -a (count $similar) -eq 0
         set -g gi_picked $hits
         info "found: $hits[1]"
         return 0
-    else if test (count $hits) -gt 1
-        set head "'$name' is in "(count $hits)" places in $shown:"
+    else if test $n_exact -ge 1
+        set head "'$name': $n_exact exact match(es), and "(count $similar)" more that contain it:"
     end
-    if test (count $hits) -eq 0
+
+    if test $n_exact -eq 0
         set hits (gi_find $p $name partial)
         if test (count $hits) -eq 0
             warn "'$t' was not found inside $shown, skipped"
             return 1
         end
         set head "Nothing is called '$name' in $shown. Possible matches:"
+        set similar
     end
 
+    set -l all $hits $similar
     set -l cap 30
-    set -l total (count $hits)
-    test $total -gt $cap; and set hits $hits[1..$cap]
+    set -l total (count $all)
+    test $total -gt $cap; and set all $all[1..$cap]
     echo
     echo $head
-    for i in (seq (count $hits))
+    for i in (seq (count $all))
         set -l kind file
-        test -d $p/$hits[$i] -a ! -L $p/$hits[$i]; and set kind folder
-        printf '  %3d) %s   (%s)\n' $i $hits[$i] $kind
+        test -L $p/$all[$i]; and set kind link
+        test -d $p/$all[$i] -a ! -L $p/$all[$i]; and set kind folder
+        set -l tag ""
+        set -l star " "
+        if test $i -le $n_exact
+            set tag ", exact name"
+            set star "*"
+        end
+        printf ' %s%3d) %s   (%s%s)\n' $star $i $all[$i] $kind $tag
     end
     test $total -gt $cap; and echo "  ... $total matches, only the first $cap are shown (type a longer name to narrow it down)"
-    ask "Which one(s)? (numbers like 1,3 or all; Enter = skip): "; or return 1
+    echo "  Pick the ones git should $act:"
+    set -l enter skip
+    test $n_exact -gt 0; and set enter "the * one(s)"
+    ask "Choose (number(s) or all; Enter = $enter): "; or return 1
+
+    set -l idx
     if test -z "$reply"
-        echo "  skipped '$t'"
-        return 1
+        if test $n_exact -eq 0
+            echo "  skipped '$t'"
+            return 1
+        end
+        set idx (seq $n_exact)
+    else
+        set idx (parse_selection (string replace -ra '\s+' ',' -- $reply) (count $all)); or return 1
     end
-    set -l idx (parse_selection (string replace -ra '\s+' ',' -- $reply) (count $hits)); or return 1
     for k in $idx
-        set -a gi_picked $hits[$k]
+        set -a gi_picked $all[$k]
+    end
+    # the matches that were not picked: they stay tracked, unless a folder that is left out holds them
+    for k in (seq (count $all))
+        contains -- $k $idx; or set -a gi_unpicked $all[$k]
     end
     return 0
+end
+
+# gi_report P NAME : list the files git will NOT track and the ones it keeps tracking. Reads the globals
+# $gi_r_dirs (folders left out whole, "." = the whole folder), $gi_r_files (single files and file types)
+# and $gi_r_kept. Sets $gi_r_n to the number of files left out.
+function gi_report
+    set -l p $argv[1]
+    set -l name $argv[2]
+    set -l cap 60
+    set -l out
+    for d in $gi_r_dirs
+        set -l root $p
+        test "$d" != .; and set root $p/$d
+        set -l found (find $root -mindepth 1 -not -path '*/.git/*' $gi_xf \( -type f -o -type l \) -print | sort)
+        test (count $found) -gt 0; and set -a out (string replace -- "$p/" "" $found)
+    end
+    for f in $gi_r_files
+        set -a out $f
+    end
+    if test (count $out) -gt 0
+        set out (printf '%s\n' $out | sort -u)
+        for k in $gi_r_kept
+            test (count $out) -gt 0; or break
+            set out (printf '%s\n' $out | grep -vxF -- $k)
+        end
+    end
+
+    set -l n (count $out)
+    set -g gi_r_n $n
+    echo
+    set_color --bold
+    echo "Git will NOT track $n file(s):"
+    set_color normal
+    test $n -eq 0; and echo "  (nothing matches yet; files that appear later will be skipped)"
+    set -l i 0
+    for f in $out
+        set i (math $i + 1)
+        test $i -gt $cap; and break
+        echo "  $name/$f"
+    end
+    test $n -gt $cap; and echo "  ... and "(math $n - $cap)" more"
+    if test (count $gi_r_kept) -gt 0
+        echo
+        set_color --bold
+        echo "Git KEEPS tracking:"
+        set_color normal
+        for k in $gi_r_kept
+            echo "  $name/$k"
+        end
+    end
+    echo
+    echo "Everything else in the folder stays tracked."
 end
 
 # git_ignore_dir P NAME : P is the live folder, NAME its place in the notes. Asks what to keep out
@@ -1571,109 +1861,352 @@ function git_ignore_dir
     set -l shown (string replace -- "$HOME/" '~/' $p)
     set -l base "/"(gi_esc $name)
 
-    echo
-    echo "Leave out of git (comma separated): *.log  logs/*.log  cache.db  data/.venv"
-    ask "Leave out (Enter = whole folder): "; or return 1
-
-    set -l words (string split -n ' ' -- (string replace -a , ' ' -- $reply))
-    if test -z "$reply"; or contains -- . $words
-        gi_whole $p $name
-        return 0
+    # patterns the backup skips (exclude=...): hidden from the tree and from every search below
+    set -g gi_excl
+    set -q argv[3]; and set gi_excl $argv[3..-1]
+    set -g gi_xf
+    for e in $gi_excl
+        set -a gi_xf -not -path "*/$e" -not -path "*/$e/*"
     end
 
-    set -l toks
-    if string match -q '*,*' -- $reply
-        set toks (string split -n , -- $reply)
-    else
-        set toks (string split -n ' ' -- $reply)
-    end
+    # the folder is listed here (only a folder, never a single file), so the answer can refer to it
+    tree_show $p
 
     set -l lines        # the lines for .gitignore
     set -l ign_dirs     # folders (from the tracked folder) that are ignored whole
     set -l ign_files    # files (from the tracked folder) that are ignored
-    for t in $toks
-        set t (string trim -- $t)
-        set t (string trim -c "'\"" -- $t)
-        test -n "$t"; or continue
-        set -l rel $t
-        # a typed ~/... or full path inside the folder becomes a path from the folder
-        set rel (string replace -r -- '^~' "$HOME" $rel)
-        if string match -q -- "$p/*" $rel
-            set rel (string sub -s (math (string length -- "$p/") + 1) -- $rel)
-        end
-        set rel (string replace -r -- '^(\./)+' '' $rel)
-        set rel (string trim -r -c / -- $rel)
-        if test -z "$rel"; or string match -q -- '/*' $rel; or string match -qr '(^|/)\.\.(/|$)' -- $rel
-            warn "'$t' is not inside $shown, skipped"
-            continue
+    set -l plan         # what each word was understood as, shown before anything is written
+    set -l old_lines    # lines of an earlier run that the new ones replace
+    set -l kept_all     # what is kept tracked inside the left-out folders and types
+    while true
+        set old_lines
+        set kept_all
+        set lines
+        set ign_dirs
+        set ign_files
+        set plan
+        set -l skipped_hits   # matches of a name that were not picked
+        set -l type_pats      # the file types left out: "folder|pattern"
+        set -l whole 0
+        set -l keep_words
+        echo
+        echo "What should git NOT track in this folder?"
+        echo "  Separate with spaces or commas. Use 'quotes' for names with spaces."
+        echo "    png jpg      every file of that type"
+        echo "    cache.db     a file or folder with that name (searched in the folder)"
+        echo "    logs/*.log   a path inside the folder"
+        ask "Not tracked (Enter = the whole folder, q = cancel): "; or return 1
+        test "$reply" = q; and return 1
+
+        set -l words (string split -n ' ' -- (string replace -a , ' ' -- $reply))
+        set -l toks
+        if test -z "$reply"; or contains -- . $words
+            # the whole folder; but something inside it may still be wanted in git
+            ask "Whole folder not tracked. Exceptions git should still track? (names or paths; Enter = none): "; or return 1
+            if test -z "$reply"
+                gi_whole $p $name
+                return 0
+            end
+            set whole 1
+            set keep_words (gi_split $reply $p)
+        else
+            set toks (gi_split $reply $p)
         end
 
-        set -l dpart ""
-        set -l bpart $rel
-        if string match -q '*/*' -- $rel
-            set dpart (string replace -r -- '/[^/]*$' '' $rel)
-            set bpart (string replace -r -- '^.*/' '' $rel)
-        end
-        if string match -qr '[*?\[]' -- $dpart
-            warn "'$t': wildcards work only in the file part (like logs/*.log), skipped"
-            continue
+        # 1) what does each word mean? a path from the folder; a bare word that is a file type
+        #    (png, .png) becomes *.png when no file or folder has exactly that name
+        set -l w_t
+        set -l w_rel
+        for t in $toks
+            set t (string trim -- $t)
+            set t (string trim -c "'\"" -- $t)
+            test -n "$t"; or continue
+            set -l rel (string replace -r -- '^~' "$HOME" $t)
+            if string match -q -- "$p/*" $rel
+                set rel (string sub -s (math (string length -- "$p/") + 1) -- $rel)
+            end
+            set rel (string replace -r -- '^(\./)+' '' $rel)
+            set rel (string trim -r -c / -- $rel)
+            if test -z "$rel"; or string match -q -- '/*' $rel; or string match -qr '(^|/)\.\.(/|$)' -- $rel
+                warn "'$t' is not inside $shown, skipped"
+                continue
+            end
+            set -l as_name 1
+            set -l ext ""
+            if string match -qr -- '^\.[A-Za-z0-9]+$' $rel; and test (gi_find $p $rel exact | count) -eq 0
+                set ext (string replace -- . '' $rel)        # .png
+                set as_name 0
+            else if string match -qr -- '^[A-Za-z0-9]+$' $rel
+                set -l nm (gi_find $p $rel exact | count)
+                set -l ec (gi_ext_hits $p $rel | count)
+                if test $nm -eq 0 -a $ec -gt 0
+                    set ext $rel                              # png
+                    set as_name 0
+                else if test $nm -gt 0 -a $ec -gt 0
+                    echo
+                    echo "'$rel' is the name of $nm file/folder(s) and also the type of $ec file(s) (*.$rel)."
+                    ask "  n = the name(s), t = the *.$rel files, b = both (Enter = n): "; or return 1
+                    switch (string lower -- $reply)
+                        case t
+                            set ext $rel
+                            set as_name 0
+                        case b
+                            set ext $rel
+                    end
+                end
+            end
+            if test $as_name -eq 1
+                set -a w_t $t
+                set -a w_rel $rel
+            end
+            if test -n "$ext"
+                set -a w_t $t
+                set -a w_rel "*.$ext"
+            end
         end
 
-        if string match -qr '[*?\[]' -- $bpart
-            # a type of file
-            if test -n "$dpart"
-                # logs/*.log : only that folder
-                if not test -d $p/$dpart -a ! -L $p/$dpart
-                    warn "'$t': there is no folder '$dpart' inside $shown, skipped"
-                    continue
+        # 2) folders and names first, then the types: files that sit inside a folder that is
+        #    ignored whole need no line of their own
+        set -l order
+        for i in (seq (count $w_rel))
+            string match -qr '[*?\[]' -- $w_rel[$i]; or set -a order $i
+        end
+        for i in (seq (count $w_rel))
+            string match -qr '[*?\[]' -- $w_rel[$i]; and set -a order $i
+        end
+
+        for i in $order
+            set -l t $w_t[$i]
+            set -l rel $w_rel[$i]
+            set -l dpart ""
+            set -l bpart $rel
+            if string match -q '*/*' -- $rel
+                set dpart (string replace -r -- '/[^/]*$' '' $rel)
+                set bpart (string replace -r -- '^.*/' '' $rel)
+            end
+            if string match -qr '[*?\[]' -- $dpart
+                warn "'$t': wildcards work only in the file part (like logs/*.log), skipped"
+                continue
+            end
+
+            if string match -qr '[*?\[]' -- $bpart
+                # a type of file
+                if test -n "$dpart"
+                    # logs/*.log : only that folder
+                    if not test -d $p/$dpart -a ! -L $p/$dpart
+                        warn "'$t': there is no folder '$dpart' inside $shown, skipped"
+                        continue
+                    end
+                    set -l found (find $p/$dpart -maxdepth 1 \( -type f -o -type l \) -name $bpart -printf '%f\n' | sort)
+                    test (count $found) -eq 0; and warn "'$t': no file matches yet, the rule is added anyway"
+                    for f in $found
+                        set -a ign_files "$dpart/$f"
+                    end
+                    set -l ln "$base/"(gi_esc $dpart)"/$bpart"
+                    contains -- $ln $lines; or set -a lines $ln
+                    set -a type_pats "$dpart|$bpart"
+                    set -a plan (printf '  %-14s every %s in %s/  (%s file(s))' $t $bpart $dpart (count $found))
+                else
+                    # *.png : every folder that holds such files, each recorded with its own path
+                    set -l files
+                    for f in (find $p \( -type f -o -type l \) -not -path '*/.git/*' $gi_xf -name $bpart -printf '%P\n' | sort)
+                        set -l covered 0
+                        for d in $ign_dirs
+                            string match -q -- "$d/*" $f; and set covered 1
+                        end
+                        test $covered -eq 0; and set -a files $f
+                    end
+                    if test (count $files) -eq 0
+                        warn "'$t': nothing to add (no such file, or already inside a folder you left out)"
+                        continue
+                    end
+                    set -l rdirs
+                    for f in $files
+                        set -a ign_files $f
+                        set -l rd ""
+                        string match -q '*/*' -- $f; and set rd (string replace -r -- '/[^/]*$' '' $f)
+                        contains -- "$rd" $rdirs; or set -a rdirs "$rd"
+                    end
+                    for rd in $rdirs
+                        set -l ln "$base/$bpart"
+                        test -n "$rd"; and set ln "$base/"(gi_esc $rd)"/$bpart"
+                        contains -- $ln $lines; or set -a lines $ln
+                    end
+                    set -a type_pats "|$bpart"
+                    set -a plan (printf '  %-14s every %s  (%s file(s) in %s folder(s))' $t $bpart (count $files) (count $rdirs))
                 end
-                set -l found (find $p/$dpart -maxdepth 1 \( -type f -o -type l \) -name $bpart -printf '%f\n' | sort)
-                test (count $found) -eq 0; and warn "'$t': no file matches yet, the rule is added anyway"
-                for f in $found
-                    set -a ign_files "$dpart/$f"
-                end
-                set -l ln "$base/"(gi_esc $dpart)"/$bpart"
-                contains -- $ln $lines; or set -a lines $ln
             else
-                # *.log : every folder that holds such files, each recorded with its own path
-                set -l files (find $p \( -type f -o -type l \) -name $bpart -printf '%P\n' | sort)
-                if test (count $files) -eq 0
-                    warn "'$t': no file like that was found inside $shown, nothing added for it"
-                    continue
-                end
-                set -l rdirs
-                for f in $files
-                    set -a ign_files $f
-                    set -l rd ""
-                    string match -q '*/*' -- $f; and set rd (string replace -r -- '/[^/]*$' '' $f)
-                    contains -- "$rd" $rdirs; or set -a rdirs "$rd"
-                end
-                for rd in $rdirs
-                    set -l ln "$base/$bpart"
-                    test -n "$rd"; and set ln "$base/"(gi_esc $rd)"/$bpart"
+                # one file or one folder: search for the name, and pick when it is in several places
+                gi_resolve $p $t $rel; or continue
+                set -a skipped_hits $gi_unpicked
+                for r in $gi_picked
+                    set -l ln "$base/"(gi_esc $r)
+                    if test -d $p/$r -a ! -L $p/$r
+                        set ln "$ln/"
+                        set -a ign_dirs $r
+                        set -a plan (printf '  %-14s folder %s/  (%s items)' $t $r (find $p/$r -mindepth 1 | count))
+                    else
+                        set -a ign_files $r
+                        set -a plan (printf '  %-14s file   %s' $t $r)
+                    end
                     contains -- $ln $lines; or set -a lines $ln
                 end
             end
-        else
-            # one file or one folder: search for the name, and pick when it is in several places
-            gi_resolve $p $t $rel; or continue
+        end
+
+        # a folder inside another folder that is ignored whole needs no line of its own
+        set -l inner
+        for d in $ign_dirs
+            set -l nested 0
+            for e in $ign_dirs
+                test "$e" != "$d"; and string match -q -- "$e/*" $d; and set nested 1
+            end
+            test $nested -eq 1; or continue
+            set -a inner $d
+            set -l ln "$base/"(gi_esc $d)"/"
+            set -l keep
+            for l in $lines
+                test "$l" != "$ln"; and set -a keep $l
+            end
+            set lines $keep
+            set -a plan "                 ($d/ is inside a folder that is ignored whole, no line of its own)"
+        end
+        if test (count $inner) -gt 0
+            set -l outer
+            for d in $ign_dirs
+                contains -- $d $inner; or set -a outer $d
+            end
+            set ign_dirs $outer
+        end
+
+        test $whole -eq 1; and set ign_dirs .
+
+        # 3) what should still be tracked inside what is left out? A folder that is left out whole holds
+        #    its files too, so something kept in it needs the folder to be ignored by its contents instead.
+        set -l keeps
+        set -l auto
+        for u in (printf '%s\n' $skipped_hits | sort -u)
+            test -n "$u"; or continue
+            gi_under $u $ign_dirs >/dev/null; and set -a auto $u
+        end
+        if test (count $auto) -gt 0
+            echo
+            echo "You did not pick these, but they are inside a folder git will not track, so they would be skipped too:"
+            printf '    %s\n' $auto
+            yes_no "Make git track them anyway?" y; and set -a keeps $auto
+        end
+        set -l kw $keep_words
+        if test $whole -eq 0
+            echo
+            ask "Any exceptions git should still track? (names or paths; Enter = none): "; or return 1
+            set kw (gi_split $reply $p)
+        end
+        for t in $kw
+            set -l krel (gi_rel $p $t); or begin
+                warn "'$t' is not inside $shown, skipped"
+                continue
+            end
+            gi_resolve $p $t $krel "KEEP tracked"; or continue
             for r in $gi_picked
-                set -l ln "$base/"(gi_esc $r)
-                if test -d $p/$r -a ! -L $p/$r
-                    set ln "$ln/"
-                    set -a ign_dirs $r
-                else
-                    set -a ign_files $r
-                end
-                contains -- $ln $lines; or set -a lines $ln
+                contains -- $r $keeps; or set -a keeps $r
             end
         end
+
+        set -l tail          # ! lines for files of a left-out type
+        set kept_all $keeps
+        if test (count $keeps) -gt 0
+            set -l by_dir    # "dir|path" pairs
+            set -l real      # exceptions that really change something
+            set -l already   # exceptions that git tracks anyway
+            for k in $keeps
+                # left out by name AND an exception: the exception wins, its own ignore line goes
+                set -l own "$base/"(gi_esc $k)
+                if contains -- $own $lines
+                    set -l nl
+                    for l in $lines
+                        test "$l" != "$own"; and set -a nl $l
+                    end
+                    set lines $nl
+                    set -l nf
+                    for f in $ign_files
+                        test "$f" != "$k"; and set -a nf $f
+                    end
+                    set ign_files $nf
+                    set -a real $k
+                    set -a plan (printf '  %-14s KEEP   %s  (also left out by name: tracked)' keep $k)
+                    continue
+                end
+                set -l d (gi_under $k $ign_dirs)
+                if test $status -eq 0
+                    set -a by_dir "$d|$k"
+                    set -a plan (printf '  %-14s KEEP   %s' keep $k)
+                    set -a real $k
+                    continue
+                end
+                # not in a left-out folder: is it a file of a left-out type?
+                set -l hit 0
+                for tp in $type_pats
+                    set -l tpd (string split -m1 '|' -- $tp)[1]
+                    set -l tpb (string split -m1 '|' -- $tp)[2]
+                    set -l kd ""
+                    string match -q '*/*' -- $k; and set kd (string replace -r -- '/[^/]*$' '' $k)
+                    if string match -q -- $tpb (string replace -r -- '^.*/' '' $k); and begin; test -z "$tpd"; or test "$tpd" = "$kd"; end
+                        set hit 1
+                    end
+                end
+                if test $hit -eq 1
+                    set -l ln "!$base/"(gi_esc $k)
+                    contains -- $ln $tail; or set -a tail $ln
+                    set -a plan (printf '  %-14s KEEP   %s' keep $k)
+                    set -a real $k
+                else
+                    set -a already $k
+                end
+            end
+            set kept_all $real
+            test (count $already) -gt 0; and info (count $already)" exception(s) are not left out by anything above, git tracks them anyway"
+            for d in $ign_dirs
+                set -l ks
+                for bp in $by_dir
+                    set -l bd (string split -m1 '|' -- $bp)[1]
+                    test "$bd" = "$d"; and set -a ks (string split -m1 '|' -- $bp)[2]
+                end
+                test (count $ks) -gt 0; or continue
+                # the plain "folder/" line (from this run or an earlier one) is replaced by folder/* and the ! lines
+                if test "$d" != .
+                    set -l old "$base/"(gi_esc $d)"/"
+                    set -l nl
+                    for l in $lines
+                        test "$l" != "$old"; and set -a nl $l
+                    end
+                    set lines $nl
+                    set -a old_lines $old
+                end
+                for l in (gi_keep_lines $p $base $d $ks)
+                    contains -- $l $lines; or set -a lines $l
+                end
+            end
+            for l in $tail
+                contains -- $l $lines; or set -a lines $l
+            end
+        end
+
+        if test (count $lines) -eq 0
+            warn "nothing to add to .gitignore"
+            return 1
+        end
+        set -g gi_r_dirs $ign_dirs
+        set -g gi_r_files $ign_files
+        set -g gi_r_kept $kept_all
+        echo
+        echo "What you typed was understood as:"
+        printf '%s\n' $plan
+        gi_report $p $name
+        yes_no "Write these rules to .gitignore?" y; and break
+        echo "  ok, type it again"
     end
 
-    if test (count $lines) -eq 0
-        warn "nothing was added to .gitignore"
-        return 1
-    end
+    gitignore_drop_folder $name
     for ln in $lines
         gitignore_add $ln
     end
@@ -1690,33 +2223,8 @@ function git_ignore_dir
         end
     end
 
-    # everything that is ignored now
-    set -l ud
-    set -l uf
-    test (count $ign_dirs) -gt 0; and set ud (printf '%s\n' $ign_dirs | sort -u)
-    test (count $ign_files) -gt 0; and set uf (printf '%s\n' $ign_files | sort -u)
-    set -l out
-    for d in $ud
-        set -a out "$name/$d/   (folder, "(find "$p/$d" -mindepth 1 | count)" items)"
-    end
-    set -l nfiles 0
-    for f in $uf
-        set -l inside 0
-        for d in $ud
-            string match -q -- "$d/*" $f; and set inside 1
-        end
-        test $inside -eq 1; and continue
-        set nfiles (math $nfiles + 1)
-        set -a out "$name/$f"
-    end
-    echo
-    if test (count $out) -eq 0
-        echo "Nothing matches yet; later matches will be ignored."
-    else
-        echo "Git will ignore: "(count $ud)" folder(s), $nfiles other file(s)"
-        printf '  %s\n' $out | head -n $tree_max
-        test (count $out) -gt $tree_max; and echo "  ... and "(math (count $out) - $tree_max)" more"
-    end
+    info "git will not track $gi_r_n file(s) of $name"
+    test (count $kept_all) -gt 0; and info "git keeps tracking "(count $kept_all)" file(s) inside it"
     return 0
 end
 
@@ -1730,7 +2238,7 @@ function dir_list
     # "private exec" work); no words = show everything
     set -l words (string split -n ' ' -- (string replace -a , ' ' -- "$argv[1]"))
     echo
-    echo "  $items_header"
+    printf '       %s\n' $items_header
     set -l shown 0
     for i in (seq (count $items_key))
         set -l ok 1
@@ -1738,8 +2246,8 @@ function dir_list
             string match -qi -- "*$w*" "$items_label[$i]"; or set ok 0
         end
         test $ok -eq 1; or continue
-        echo "  $items_label[$i]"
         set shown (math $shown + 1)
+        printf '  %3d) %s\n' $shown $items_label[$i]
     end
     echo
     echo "  $shown of "(count $items_key)" folders and files"
@@ -1811,7 +2319,72 @@ function choose_uses
     end
 end
 
+# exclude_check P PAT : PAT is something the user does NOT want copied into the notes. tar matches the WHOLE
+# name, so "not_sync" would only skip something called exactly not_sync. Checks PAT against the folder P and,
+# when nothing has that exact name, lists similar files/folders to choose from.
+# Sets the global list $ex_result (the patterns to use). Status 1 = skip this pattern.
+function exclude_check
+    set -l p $argv[1]
+    set -l pat $argv[2]
+    set -g ex_result $pat
+    if string match -q '*/*' -- $pat
+        string match -qr '[*?\[]' -- $pat; or test -e $p/$pat -o -L $p/$pat; or warn "'$pat' is not in the folder (kept, it applies if it appears)"
+        return 0
+    end
+    set -l hits (find $p -mindepth 1 -not -path '*/.git/*' -name "$pat" -printf '%P\n' | sort)
+    if test (count $hits) -gt 0
+        echo "  '$pat' will NOT be copied ("(count $hits)" item(s)):"
+        printf '    %s\n' $hits | head -n 5
+        test (count $hits) -gt 5; and echo "    ... and "(math (count $hits) - 5)" more"
+        return 0
+    end
+    if string match -qr '[*?\[]' -- $pat
+        warn "'$pat' matches nothing yet (kept, it applies if such a file appears)"
+        return 0
+    end
+    set -l near (find $p -mindepth 1 -not -path '*/.git/*' -iname "*$pat*" -printf '%P\n' | sort)
+    if test (count $near) -eq 0
+        warn "'$pat' matches nothing (kept, it applies if such a file appears)"
+        return 0
+    end
+    set -l cap 30
+    set -l total (count $near)
+    test $total -gt $cap; and set near $near[1..$cap]
+    echo "  Nothing is named exactly '$pat'. Similar:"
+    for i in (seq (count $near))
+        set -l kind file
+        test -d $p/$near[$i] -a ! -L $p/$near[$i]; and set kind folder
+        printf '  %3d) %s   (%s)\n' $i $near[$i] $kind
+    end
+    test $total -gt $cap; and echo "  ... $total matches, only the first $cap are shown"
+    echo "  Which should NOT be copied?  number(s) or all"
+    echo "    w = everything containing '$pat'    k = '$pat' exactly as typed    Enter = skip"
+    ask "Choose: "; or return 1
+    # a path typed in full is accepted as it is
+    if contains -- $reply $near
+        set -g ex_result $reply
+        return 0
+    end
+    switch (string lower -- $reply)
+        case ''
+            return 1
+        case w
+            set -g ex_result "*$pat*"
+        case k
+            set -g ex_result $pat
+        case '*'
+            set -l idx (parse_selection (string replace -ra '\s+' ',' -- $reply) (count $near)); or return 1
+            set -g ex_result
+            for k in $idx
+                set -ga ex_result $near[$k]
+            end
+    end
+    return 0
+end
+
 function dir_add
+    set -g gi_xf
+    set -g gi_excl
     set -l p $argv[1]
     if test -z "$p"
         ask "Folder or file to back up (type the path, or drag it here): "; or return 1
@@ -1840,11 +2413,6 @@ function dir_add
             warn "already tracked as '$t[2]'"
             return 1
         end
-    end
-
-    # a folder: show what is inside (hidden files too), so it is clear what is about to be backed up
-    if test -d $p -a ! -L $p
-        tree_show $p
     end
 
     # outside the home folder (/etc, /usr/local/bin...): allowed, but it is a system file. Reading it
@@ -1926,9 +2494,20 @@ function dir_add
             yes_no "Rewrite /home/... to the new home and user when restored?" y; and set -a opts rehome
         end
     end
-    ask "Leave anything else out? (e.g. .venv *.log; Enter = no): "; or return 1
-    for pat in (string split -n ' ' -- (string replace -a , ' ' -- "$reply"))
-        set -a opts "exclude=$pat"
+    echo "Anything listed here is NOT copied into the notes folder at all (git is asked about separately)."
+    ask "Don't copy (names, *.ext or paths; Enter = copy everything): "; or return 1
+    for pat in (gi_split "$reply" $p)
+        set pat (string trim -c "'\"" -- (string trim -- $pat))
+        test -n "$pat"; or continue
+        set -l pats $pat
+        if test -d $p -a ! -L $p
+            exclude_check $p $pat; or continue
+            set pats $ex_result
+        end
+        for x in $pats
+            # the options are space separated, so a space in a name becomes ? (matches any one character)
+            set -a opts "exclude="(string replace -a ' ' '?' -- $x)
+        end
     end
     test (count $uses) -gt 0; and set -a opts "de="(string join ',' $uses)
 
@@ -1949,10 +2528,14 @@ function dir_add
     # notes folder and the USB backup copy, git just never sees them)
     set -l gi_default n
     contains -- private $opts; and set gi_default y
-    if yes_no "Keep it out of git?" $gi_default
+    if yes_no "Keep (part of) it out of git? (it is still copied into the notes)" $gi_default
         if test -d $p -a ! -L $p
             # a folder: ask whether only some types / files / folders should be left out
-            git_ignore_dir $p $name
+            set -l exs
+            for o in $opts
+                string match -q -- 'exclude=*' $o; and set -a exs (string replace -- 'exclude=' '' $o)
+            end
+            git_ignore_dir $p $name $exs
         else
             set -l ig "/$name"
             test -d $p; and set ig "/$name/"
@@ -1964,6 +2547,9 @@ function dir_add
                 info "git: stopped tracking $name (the next sync commits that)"
             end
         end
+    else
+        # git may track everything: drop rules left by an earlier run for this path
+        gitignore_drop_folder $name
     end
     if yes_no "Sync it now?" y
         fish $self --sync --no-git --quiet
@@ -1999,12 +2585,20 @@ function dir_remove
     for n in $names
         tracked_remove $dirfile $n
         info "no longer tracked: $n"
+        set -l copy_gone 1
         if tracked_name_ok $n; and test -e $notes/$n -o -L $notes/$n
+            set copy_gone 0
             if yes_no "Also delete the copy in the notes ($n)?" n
                 rm -rf $notes/$n
                 info "deleted $notes/$n"
                 prune_empty (dirname $notes/$n)
+                set copy_gone 1
             end
+        end
+        if test $copy_gone -eq 1
+            tracked_name_ok $n; and gitignore_drop_folder $n
+        else
+            info "the copy stays in the notes, so its .gitignore rules stay too (they keep private files out of git)"
         end
     end
 end
