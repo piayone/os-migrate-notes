@@ -12,6 +12,7 @@
 #   ./sync-notes.sh             sync everything, then commit and push to git (origin)
 #   ./sync-notes.sh --dry-run   only show what would be replaced (alias: -n)
 #   ./sync-notes.sh --no-git    sync the files but skip the git commit and push
+#   ./sync-notes.sh --quiet     do not list every copied file
 #   ./sync-notes.sh --sync      skip the menu and sync (same as the default)
 #   ./sync-notes.sh --backup    skip the menu and make a copy for a USB drive / phone
 #   ./sync-notes.sh --set-repo  set or change the git repo URL (also menu option 3)
@@ -39,7 +40,8 @@
 #                                       manager. remove / uninstall / list accept the name or the original one.
 #                                       A pipx app that is not on PyPI asks for a name right after it is installed.
 #   ./sync-notes.sh pkg install         install everything in packages.conf now
-#   ./sync-notes.sh dir list            list the tracked folders
+#   ./sync-notes.sh dir list [text]     list the tracked folders (optionally only lines containing text,
+#                                       e.g. mango, sddm, private; several words must all match)
 #   ./sync-notes.sh dir add [path]      start backing up a folder or file. It is saved under Backup/ with
 #                                       the same path it has in your home folder (~/Downloads/clean.py ->
 #                                       Backup/Downloads/clean.py), or, when you say it belongs to one
@@ -49,6 +51,10 @@
 #                                       part of it: *.log (every folder that has some), logs/*.log, one
 #                                       file or one folder; the paths written to .gitignore are listed
 #   ./sync-notes.sh dir remove          stop backing one up
+#   ./sync-notes.sh dir rename [item [name]]  give a folder or file a name of your own, any text (saved as name=NAME on its
+#                                       line in tracked.conf). The lists show it in the NAME column instead of the
+#                                       file or folder name; the PATH column shows a folder's own path, or the folder
+#                                       a file sits in. "-" as the name goes back to the file or folder name.
 #   ./sync-notes.sh dir de              add a desktop environment: scans ~/.config for known desktops (hypr,
 #                                       sway, niri, mango, KDE...), or asks for a path; backs up its config
 #                                       under Desktop Environment/<name>/ and makes pre.fish / post.fish
@@ -115,6 +121,9 @@ if contains -- --dry-run $argv; or contains -- -n $argv
     info "dry run: nothing will be changed"
 end
 
+set quiet 0
+contains -- --quiet $argv; and set quiet 1
+
 set no_git 0
 if contains -- --no-git $argv
     set no_git 1
@@ -133,7 +142,7 @@ if test -f $extras/lib.fish
 else
     set have_lib 0
     set pm none
-    warn "missing $extras/lib.fish: the folders in tracked.conf are skipped and the manager is unavailable"
+    warn "missing $extras/lib.fish: tracked folders skipped, manager unavailable"
     function tracked_list; end
     function tracked_name_ok; return 1; end
     set -g layout_backup Backup
@@ -254,7 +263,7 @@ function set_repo_url
         return 1
     end
     if not string match -qr '^((https?|ssh|git|file)://.+|[A-Za-z0-9._-]+@\S+:.+|/.+)$' -- $url
-        warn "that does not look like a git URL (https://..., git@host:user/repo.git, ssh://...)"
+        warn "not a git URL (https://..., git@host:user/repo.git)"
         return 1
     end
     if test $dry -eq 1
@@ -263,11 +272,11 @@ function set_repo_url
     end
     mkdir -p $repo_cfg; and chmod 700 $repo_cfg
     printf '%s\n' $url >$repo_url_file; and chmod 600 $repo_url_file
-    info "repo URL saved in $repo_url_file (outside the notes, not synced or backed up)"
+    info "repo URL saved (outside the notes, never synced)"
     if test -d $notes/.git
         apply_remote $url; and info "git: origin -> "(mask_url $url)
     else
-        info "this folder is not a git repository yet; the next sync offers to set it up"
+        info "not a git repo yet; the next sync offers to set it up"
     end
 end
 
@@ -275,18 +284,18 @@ end
 # Returns 1 when the git step has to be skipped.
 function ensure_repo
     if not type -q git
-        warn "git backup skipped: git is not installed"
+        warn "git skipped: git is not installed"
         return 1
     end
 
     if not test -d $notes/.git
         if test $dry -eq 1; or not is_tty
-            warn "git backup skipped: $notes is not a git repository (run sync-notes.sh by hand and choose 3 to set one up)"
+            warn "git skipped: not a repo (menu option 3 sets one up)"
             return 1
         end
         read -P "$notes is not a git repository. Set one up here? [y/N]: " yn
         if not string match -qri '^y' -- $yn
-            warn "git backup skipped"
+            warn "git skipped"
             return 1
         end
         git -C $notes init -q -b main; or return 1
@@ -305,7 +314,7 @@ function ensure_repo
         else if test $dry -eq 0; and is_tty
             set_repo_url; or return 1
         else
-            warn "git backup skipped: no 'origin' remote and no saved URL (run sync-notes.sh by hand and choose 3)"
+            warn "git skipped: no origin and no saved URL (menu option 3)"
             return 1
         end
     end
@@ -313,7 +322,7 @@ function ensure_repo
     # the backup copy leaves .gitignore out, so a restored folder may lack one: without it
     # "git add -A" would commit images and logs that are meant to stay private
     if not test -f $notes/.gitignore
-        warn "git backup skipped: no .gitignore in $notes, add one first so private files are not committed"
+        warn "git skipped: no .gitignore (add one first)"
         return 1
     end
     return 0
@@ -364,7 +373,7 @@ function pick_items
     set -l only_missing 0
     set -l noun $items_noun
     test -n "$noun"; or set noun items
-    set -l hint "numbers like 1,3-5, all"
+    set -l hint "1,3-5 / all"
     test (count $items_inst) -gt 0; and set hint "$hint, missing"
     while true
         set -g view
@@ -394,7 +403,7 @@ function pick_items
         end
         echo
         echo "  $n of "(count $items_key)" $noun$items_foot"
-        ask "$argv[1] ($hint, or words to filter; Enter = cancel): "; or return 1
+        ask "$argv[1] ($hint, or text to filter): "; or return 1
         test -n "$reply"; or return 1
 
         if test "$reply" = missing; and test (count $items_inst) -gt 0
@@ -434,7 +443,7 @@ function pick_items
         end
         set any 0
         if test (count $hit) -gt 0
-            echo "  not in the list: $unknown (showing everything that matches your words)"
+            echo "  not in the list: $unknown (showing matches)"
             set any 1
         end
         # otherwise filter: every word must be in the name (or any word, after a partial name match)
@@ -496,7 +505,7 @@ function build_pkg_items
         set -l alias (entry_alias $toks)
         if test -n "$alias"
             set shown $alias
-            set alt "$alt $alias"
+            set alt "$alt "(alias_alt $alias)
         end
         set -l inst 0
         test "$mark" = "[x]"; and set inst 1
@@ -643,7 +652,7 @@ function offer_install
             flatpak remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo
             flatpak install -y flathub $todo_flatpak
         else
-            warn "flatpak is not installed (add the package 'flatpak' to the list and run: sync-notes.sh pkg install)"
+            warn "flatpak is not installed (add it to the list, then run: pkg install)"
         end
     end
     if test (count $todo_snap) -gt 0
@@ -652,7 +661,7 @@ function offer_install
                 sudo snap install $n
             end
         else
-            warn "snap is not installed, so the snap package(s) were only added to the list"
+            warn "snap is not installed, only added to the list"
         end
     end
     if test (count $todo_pipx) -gt 0
@@ -667,7 +676,7 @@ function offer_install
                 end
             end
         else
-            warn "pipx is not installed (add python-pipx to the list), so the pipx package(s) were only added to the list"
+            warn "pipx is not installed, only added to the list"
         end
     end
     if test (count $todo_git) -gt 0
@@ -677,7 +686,7 @@ function offer_install
                 git clone $u (git_dest $u); and git_ask_install $pkgfile $u
             end
         else
-            warn "git is not installed, so the repo(s) were only added to the list"
+            warn "git is not installed, only added to the list"
         end
     end
 end
@@ -699,7 +708,7 @@ function add_one_name
         if pipx_is_pypi $px
             if not curl -sf -o /dev/null https://pypi.org/pypi/(string replace -r '[\[=<>!~].*$' '' -- $px)/json
                 warn "'$px' was not found on PyPI (or PyPI is not reachable)"
-                echo "     an app from git or a path is added as pipx:git+https://github.com/user/repo"
+                echo "     for git or a path use pipx:git+https://github.com/user/repo"
                 yes_no "Add it anyway?" n; or return 1
             end
         end
@@ -732,7 +741,7 @@ function pkg_add_name
     set -g new_git
     set -l input "$argv"
     if test -z "$input"
-        ask "Package name(s) (flatpak id like org.gimp.GIMP, pipx:name, or a git URL): "; or return 1
+        ask "Package name(s) (flatpak id, pipx:name or git URL): "; or return 1
         set input $reply
     end
     set -l words (string split -n ' ' -- (string replace -a , ' ' -- "$input"))
@@ -862,7 +871,7 @@ function pkg_search
             search_flatpak $term
     end
     if test (count $res_name) -eq 0
-        warn "nothing found for '$term'. Check the spelling, or use \"Add by name\" in the Add menu"
+        warn "nothing found for '$term' (try Add by name)"
         return 1
     end
 
@@ -912,7 +921,7 @@ function pkg_remove
     if test -n "$argv[1]"
         for i in (seq (count $items_key))
             set -l alts (string split -n ' ' -- $items_alt[$i])
-            if test $items_key[$i] = $argv[1]; or contains -- $argv[1] $alts
+            if test $items_key[$i] = $argv[1]; or contains -- (alias_alt $argv[1]) $alts
                 set -a picked $i
             end
         end
@@ -1008,7 +1017,7 @@ function pkg_rename
     ensure_pkgfile
     build_pkg_items
     if test (count $items_key) -eq 0
-        warn "packages.conf has no packages"
+        warn "no packages"
         return 1
     end
     set -g picked
@@ -1016,12 +1025,12 @@ function pkg_rename
     if test -n "$want"
         for i in (seq (count $items_key))
             set -l al (string split -n ' ' -- $items_alt[$i])
-            if test $items_key[$i] = "$want"; or contains -- $want $al
+            if test $items_key[$i] = "$want"; or contains -- (alias_alt $want) $al
                 set -a picked $i
             end
         end
         if test (count $picked) -eq 0
-            warn "nothing called '$want' in packages.conf"
+            warn "not found: $want"
             return 1
         end
     else
@@ -1038,44 +1047,44 @@ function pkg_rename
         test $sec = pipx; and string match -q -- '*://*' $key; and set shown (pipx_short $key)
         echo
         echo "  $sec: $shown"
-        test -n "$items_name[$i]"; and echo "  name now: $items_name[$i]"
+        test -n "$items_name[$i]"; and echo "  now: $items_name[$i]"
         set -l new $argv[2]
         if test -z "$new"
-            ask "  new name (letters, digits . _ + -, no spaces; '-' = no name; Enter = leave it): "; or return 1
+            ask "  new name ('-' = none, Enter = keep): "; or return 1
             set new $reply
         end
         test -n "$new"; or continue
         test "$new" = -; and set new ""
         if test -n "$new"
             if not alias_valid $new
-                warn "'$new' is not a usable name (letters, digits and . _ + - only, no spaces)"
+                warn "not a usable name"
                 continue
             end
             if test "$new" = "$items_name[$i]"
-                info "already called $new"
+                info "unchanged"
                 continue
             end
             # the name has to point at one entry only
             set -l clash 0
             for j in (seq (count $items_key))
                 test $j -eq $i; and continue
-                if test $items_key[$j] = $new -o "$items_name[$j]" = $new
+                if test "$items_key[$j]" = "$new" -o "$items_name[$j]" = "$new"
                     set clash 1
                 end
             end
             if test $clash -eq 1
-                warn "'$new' is already used by another entry"
+                warn "'$new' is taken"
                 continue
             end
         end
         if conf_set_alias $pkgfile $sec $key "$new"
             if test -n "$new"
-                info "$shown is now called $new"
+                info "$shown: $new"
             else
-                info "$shown has no name of its own any more"
+                info "$shown: name removed"
             end
         else
-            warn "could not rename $shown"
+            warn "failed: $shown"
         end
     end
 end
@@ -1093,7 +1102,7 @@ function pkg_script
         test $items_sec[$i] = git; or continue
         if test -z "$want"
             set -a picked $i
-        else if test $items_key[$i] = "$want"; or contains -- $want (string split -n ' ' -- $items_alt[$i])
+        else if test $items_key[$i] = "$want"; or contains -- (alias_alt $want) (string split -n ' ' -- $items_alt[$i])
             set -a picked $i
         end
     end
@@ -1122,7 +1131,7 @@ function pkg_script
         test -n "$cur"; and echo "  $repo: install script now: $cur"
         if test -z "$new"
             if not test -d $dir
-                warn "$repo is not cloned here ($dir), so its scripts cannot be listed; give the path: pkg script $repo PATH"
+                warn "$repo is not cloned here; give the path: pkg script $repo PATH"
                 continue
             end
             set -l cands (git_install_candidates $dir)
@@ -1233,7 +1242,7 @@ function pkg_export
 
     test $hidden -gt 0; and echo "($hidden already in packages.conf are hidden)"
     if test (count $items_key) -eq 0
-        echo "Nothing new: everything installed by hand is already in packages.conf."
+        echo "Nothing new: all installed packages are already listed."
         return 0
     end
     echo "Explicitly installed here, not in packages.conf yet:"
@@ -1262,7 +1271,7 @@ function pkg_export
             add_native $items_key[$i] $items_src[$i]
         end
     end
-    info "these are already installed here, so there is nothing to install now"
+    info "already installed here, nothing to install"
 end
 
 function pkg_install
@@ -1281,12 +1290,53 @@ function build_dir_items
     set -g items_label
     set -g items_sec
     set -g items_inst
-    set -g items_header (printf '%-42s %-26s %s' "LIVE PATH" WHERE OPTIONS)
+    set -g items_live      # the live path of each item
+    set -g items_base      # the file or folder name of each item
+    set -g items_cur       # the name of your own (name=ALIAS), empty when there is none
+    set -g items_shown     # what the NAME column shows: the name of your own, else the file or folder name
+    set -g items_pshow     # what the PATH column shows
     set -g items_noun "folders and files"
     set -g items_foot ""
+    set -l wheres
+    set -l ostrs
+    # a name with spaces must not split into words when the lists are searched for a name
+    set -l nbsp \u00a0
+    set -l wn (string length -- NAME)
+    set -l wp (string length -- PATH)
+    set -l ww 26
     for line in (tracked_list $dirfile)
         set -l p (string split \t -- $line)
-        set -l shown (string replace -- "$HOME/" '~/' $p[1])
+        set -l o ""
+        set -q p[3]; and set o $p[3]
+        # the name of your own is an option on the line; it is not repeated in the OPTIONS column
+        set -l nick ""
+        set -l kept
+        for t in (string split -n ' ' -- $o)
+            if string match -q -- 'name=*' $t
+                set nick (alias_decode (string replace -- 'name=' '' $t))
+            else
+                set -a kept $t
+            end
+        end
+        # file or folder? The live path says; when it is missing here, the copy in the notes does
+        set -l is_dir 1
+        if test -e $p[1] -o -L $p[1]
+            test -d $p[1]; or set is_dir 0
+        else if test -e $notes/$p[2] -o -L $notes/$p[2]
+            test -d $notes/$p[2]; or set is_dir 0
+        end
+        # a folder shows its own path, a file the folder it sits in
+        set -l base (basename -- $p[1])
+        set -l pshow $p[1]
+        test $is_dir -eq 0; and set pshow (dirname -- $p[1])
+        if test "$pshow" = "$HOME"
+            set pshow '~'
+        else
+            set pshow (string replace -- "$HOME/" '~/' $pshow)
+        end
+        set -l shown $base
+        test -n "$nick"; and set shown $nick
+
         set -l where $layout_backup
         set -l d (de_of_name $p[2])
         test -n "$d"; and set where "DE: $d"
@@ -1298,10 +1348,30 @@ function build_dir_items
         tracked_name_ok $p[2]; or set where "(old layout)"
         set -l mark ""
         test -e $p[1] -o -L $p[1]; or set mark "  (missing on this machine)"
-        set -l o ""
-        set -q p[3]; and set o $p[3]
+        set -l ostr (string join ' ' -- $kept)
+
         set -a items_key $p[2]
-        set -a items_label (printf '%-42s %-26s %s%s' $shown $where $o $mark)
+        set -a items_alt "$(string replace -a ' ' $nbsp -- "$nick")"
+        set -a items_live $p[1]
+        set -a items_base $base
+        set -a items_cur "$nick"
+        set -a items_shown $shown
+        set -a items_pshow $pshow
+        set -a wheres $where
+        set -a ostrs "$ostr$mark"
+
+        # column widths follow the longest entry (a very long one does not stretch the table)
+        set -l l (string length -- $shown)
+        test $l -gt $wn -a $l -le 32; and set wn $l
+        set l (string length -- $pshow)
+        test $l -gt $wp -a $l -le 48; and set wp $l
+        set l (string length -- $where)
+        test $l -gt $ww; and set ww $l
+    end
+    set -l fmt "%-"$wn"s  %-"$wp"s  %-"$ww"s  %s"
+    set -g items_header (printf $fmt NAME PATH WHERE OPTIONS)
+    for i in (seq (count $items_key))
+        set -a items_label (printf $fmt $items_shown[$i] $items_pshow[$i] $wheres[$i] "$ostrs[$i]")
     end
 end
 
@@ -1502,14 +1572,8 @@ function git_ignore_dir
     set -l base "/"(gi_esc $name)
 
     echo
-    echo "Is there anything specific to keep out of git? Type what to leave out, separated by commas"
-    echo "(or by spaces; use commas when a name has spaces):"
-    echo "  *.log         every .log file, in every folder that has some (each folder gets its own line)"
-    echo "  logs/*.log    the .log files of one folder"
-    echo "  cache.db      a file or folder by name: it is searched for inside the folder; if it is in several"
-    echo "                places (or only a similar name exists) you pick which path(s) to ignore"
-    echo "  data/.venv    a file or folder by its path from the folder"
-    ask "Leave out (Enter = the whole folder): "; or return 1
+    echo "Leave out of git (comma separated): *.log  logs/*.log  cache.db  data/.venv"
+    ask "Leave out (Enter = whole folder): "; or return 1
 
     set -l words (string split -n ' ' -- (string replace -a , ' ' -- $reply))
     if test -z "$reply"; or contains -- . $words
@@ -1647,9 +1711,9 @@ function git_ignore_dir
     end
     echo
     if test (count $out) -eq 0
-        echo "Nothing matches yet; files that appear later and match these rules will be ignored."
+        echo "Nothing matches yet; later matches will be ignored."
     else
-        echo "Git will ignore these (paths as they are in the notes folder): "(count $ud)" folder(s), $nfiles file(s) outside those folders"
+        echo "Git will ignore: "(count $ud)" folder(s), $nfiles other file(s)"
         printf '  %s\n' $out | head -n $tree_max
         test (count $out) -gt $tree_max; and echo "  ... and "(math (count $out) - $tree_max)" more"
     end
@@ -1662,62 +1726,25 @@ function dir_list
         echo "No tracked folders yet. Add one with: sync-notes.sh dir add"
         return 0
     end
+    # every word must match the path, the WHERE column or the options (so "mango", "sddm" or
+    # "private exec" work); no words = show everything
+    set -l words (string split -n ' ' -- (string replace -a , ' ' -- "$argv[1]"))
     echo
-    printf '  %-42s %-26s %s\n' "LIVE PATH" WHERE OPTIONS
-    for l in $items_label
-        echo "  $l"
-    end
-    echo
-    echo "  (Backup = restored on every machine; Backup: a,b = kept in Backup but restored only for those"
-    echo "   desktops; DE: name = restored only for that desktop. Change who uses what: sync-notes.sh dir uses)"
-end
-
-# choose_de [GUESS] : ask whether a path belongs to one desktop environment. Sets the global
-# $picked_de to that desktop's folder name in "Desktop Environment/", or to nothing when it goes
-# to Backup/. Status 1 when cancelled.
-function choose_de
-    set -g picked_de
-    set -l des (de_dirs $notes)
-    set -l guess $argv[1]
-    set -l dflt n
-    test -n "$guess"; and set dflt y
-    yes_no "Is it part of one desktop environment's setup? (then it is restored only for that desktop)" $dflt; or return 0
-
-    echo
-    echo "Which desktop?"
-    for i in (seq (count $des))
-        echo "  $i) $des[$i]"
-    end
-    set -l hint "type the name of a new one"
-    test (count $des) -gt 0; and set hint "number or name, or type the name of a new one"
-    test -n "$guess"; and set hint "$hint; Enter = $guess"
-    ask "Desktop ($hint): "; or return 1
-
-    set -l pick $reply
-    if test -z "$pick"
-        test -n "$guess"; or return 1
-        set pick $guess
-    else if string match -qr '^[0-9]+$' -- $pick
-        if test $pick -ge 1 -a $pick -le (count $des)
-            set pick $des[$pick]
-        else
-            warn "no desktop number $pick"
-            return 1
+    echo "  $items_header"
+    set -l shown 0
+    for i in (seq (count $items_key))
+        set -l ok 1
+        for w in $words
+            string match -qi -- "*$w*" "$items_label[$i]"; or set ok 0
         end
+        test $ok -eq 1; or continue
+        echo "  $items_label[$i]"
+        set shown (math $shown + 1)
     end
-
-    # a folder that matches in another letter case is the same desktop
-    set -l ex (de_dir_name $notes $pick)
-    if test -n "$ex"
-        set pick $ex
-    else
-        if not string match -qr '^[A-Za-z][A-Za-z0-9._-]*$' -- $pick
-            warn "'$pick' is not a good desktop name (start with a letter; letters, digits, . _ - only)"
-            return 1
-        end
-        yes_no "There is no desktop called '$pick' yet. Create it?" y; or return 1
-    end
-    set -g picked_de $pick
+    echo
+    echo "  $shown of "(count $items_key)" folders and files"
+    echo
+    echo "  (Backup = every machine; Backup: x = only desktop x; DE: x = only desktop x's folder)"
 end
 
 # de_mentions TEXT : the desktops whose files in the notes mention TEXT (a name like rofi), one per
@@ -1746,7 +1773,7 @@ function choose_uses
     test (count $dflt) -eq 0; and set dflt $found
 
     echo
-    echo "Which desktops use it? (it stays in $layout_backup/; only the restore is limited to them)"
+    echo "Which desktops use it?"
     for i in (seq (count $des))
         set -l mark ""
         contains -- $des_lc[$i] $found; and set mark "   <- their files mention '$word'"
@@ -1755,7 +1782,7 @@ function choose_uses
     echo "  a) all of them (restored on every machine)"
     set -l dl all
     test (count $dflt) -gt 0; and set dl (string join ' ' -- $dflt)
-    set -l hint "numbers or names, e.g. '1 2'; a new name is fine too"
+    set -l hint "numbers or names"
     ask "Desktops ($hint; Enter = $dl): "; or return 1
     if test -z "$reply"
         set -g picked_uses $dflt
@@ -1826,9 +1853,7 @@ function dir_add
     string match -q -- "$HOME/*" $p; or set is_sys 1
     if test $is_sys -eq 1
         echo
-        warn "$p is outside your home folder (a system file)"
-        echo "   - it is copied into the notes under $layout_system/ (reading it may ask for your sudo password)"
-        echo "   - initual-setup.sh puts it back with sudo, as root, and replaces whatever is there"
+        warn "system file: copied to $layout_system/, restored with sudo (replaces what is there)"
         yes_no "Are you sure you want to back it up?" n; or begin
             echo "cancelled"
             return 1
@@ -1840,10 +1865,28 @@ function dir_add
     set -l def (basename $p)
     set -l guess (de_dir_name $notes $def)
     set -g picked_de ""
-    if test $is_sys -eq 0
-        choose_de $guess; or begin
+    # one question: is it only for some desktops? One desktop -> saved in that desktop's own folder
+    # (restored only for it); several -> stays in Backup/ with a de= limit; none -> every machine.
+    # A system file always stays under System/ (limited with de= when desktops are picked).
+    set -l uses
+    set -l hit
+    test $is_sys -eq 0; and set hit (de_mentions $def)
+    set -l ud n
+    test -n "$guess" -o (count $hit) -gt 0; and set ud y
+    if yes_no "Only for some desktops?" $ud
+        choose_uses $def $guess; or begin
             echo "cancelled"
             return 1
+        end
+        if test $is_sys -eq 0 -a (count $picked_uses) -eq 1
+            set -l ex (de_dir_name $notes $picked_uses[1])
+            if test -n "$ex"
+                set -g picked_de $ex
+            else
+                set -g picked_de $picked_uses[1]
+            end
+        else
+            set uses $picked_uses
         end
     end
     set -l name (tracked_name_for $p $picked_de)
@@ -1864,23 +1907,9 @@ function dir_add
         yes_no "Continue?" n; or return 1
     end
 
-    # Backup/ is restored on every machine, unless only some desktops use it (rofi, ...). It stays in
-    # Backup/ either way: the desktops are just a limit on the restore.
-    set -l uses
-    if test -z "$picked_de"
-        set -l hit
-        test $is_sys -eq 0; and set hit (de_mentions $def)
-        set -l ud n
-        test (count $hit) -gt 0; and set ud y
-        if yes_no "Do only some desktops use it? (it stays in "(test $is_sys -eq 1; and echo $layout_system; or echo $layout_backup)"/, but is restored only for them)" $ud
-            choose_uses $def; or return 1
-            set uses $picked_uses
-        end
-    end
-
     set -l opts
-    yes_no "Does it hold secrets? (locked down, and kept out of git)" n; and set -a opts private
-    yes_no "Make its .sh and .py files executable when restored?" n; and set -a opts exec
+    yes_no "Can other users read it?" y; or set -a opts private
+    yes_no "Make the file(s) executable?" n; and set -a opts exec
     if test $is_sys -eq 1
         # systemd unit: switch it on after restoring
         if string match -qr -- '/systemd/(system|user)/[^/]+\.(service|timer|socket|path|target)$' $p
@@ -1894,10 +1923,10 @@ function dir_add
             grep -IlF -- "/home/" $p >/dev/null 2>&1; and set homes 1
         end
         if test $homes -eq 1
-            yes_no "It mentions /home/...: rewrite that to the new machine's home folder and user when restored?" y; and set -a opts rehome
+            yes_no "Rewrite /home/... to the new home and user when restored?" y; and set -a opts rehome
         end
     end
-    ask "Leave anything out? (names or patterns like .venv or *.log, space separated; Enter = nothing): "; or return 1
+    ask "Leave anything else out? (e.g. .venv *.log; Enter = no): "; or return 1
     for pat in (string split -n ' ' -- (string replace -a , ' ' -- "$reply"))
         set -a opts "exclude=$pat"
     end
@@ -1913,14 +1942,14 @@ function dir_add
     # a new desktop gets its folder right away, so the setup already lists it
     if test -n "$picked_de"; and not test -d $notes/$layout_de/$picked_de
         mkdir -p $notes/$layout_de/$picked_de
-        info "new desktop '$picked_de': optional pre.fish / post.fish in $layout_de/$picked_de run during the setup"
+        info "new desktop '$picked_de': pre.fish / post.fish go in $layout_de/$picked_de"
     end
 
     # keep it out of git? (separate from "secrets": the files are still copied into the
     # notes folder and the USB backup copy, git just never sees them)
     set -l gi_default n
     contains -- private $opts; and set gi_default y
-    if yes_no "Keep it out of git? (still backed up in the notes folder and the USB copy)" $gi_default
+    if yes_no "Keep it out of git?" $gi_default
         if test -d $p -a ! -L $p
             # a folder: ask whether only some types / files / folders should be left out
             git_ignore_dir $p $name
@@ -1936,8 +1965,8 @@ function dir_add
             end
         end
     end
-    if yes_no "Copy it into the notes now? (a sync without the git step)" y
-        fish $self --sync --no-git
+    if yes_no "Sync it now?" y
+        fish $self --sync --no-git --quiet
     end
 end
 
@@ -1976,6 +2005,92 @@ function dir_remove
                 info "deleted $notes/$n"
                 prune_empty (dirname $notes/$n)
             end
+        end
+    end
+end
+
+# dir_rename [ITEM [NEWNAME]] : give a tracked folder or file a name of your own (name=NAME on its line in
+# tracked.conf). The NAME column of the lists shows it in place of the file or folder name. ITEM is
+# that name, the old file or folder name, the live path or the place in the notes. "-" as the new
+# name goes back to the file or folder name.
+function dir_rename
+    build_dir_items
+    if test (count $items_key) -eq 0
+        warn "nothing tracked"
+        return 1
+    end
+    set -g picked
+    set -l want $argv[1]
+    if test -n "$want"
+        set -l wl (string replace -r -- '^~' "$HOME" $want)
+        for i in (seq (count $items_key))
+            if test "$items_cur[$i]" = "$want" -o "$items_key[$i]" = "$want" -o "$items_live[$i]" = "$wl" -o "$items_base[$i]" = "$want"
+                set -a picked $i
+            end
+        end
+        if test (count $picked) -eq 0
+            warn "not found: $want"
+            return 1
+        end
+        if test (count $picked) -gt 1; and test -n "$argv[2]"
+            warn "'$want' matches several: use the live path"
+            for i in $picked
+                echo "  $items_live[$i]"
+            end
+            return 1
+        end
+    else
+        pick_items "Rename which?"; or begin
+            echo "cancelled"
+            return 0
+        end
+    end
+
+    for i in $picked
+        set -l place $items_key[$i]
+        echo
+        echo "  $items_base[$i]   ($items_pshow[$i])"
+        test -n "$items_cur[$i]"; and echo "  now: $items_cur[$i]"
+        set -l new (string trim -- "$argv[2]")
+        if test -z "$new"
+            ask "  new name ('-' = none, Enter = keep): "; or return 1
+            set new $reply
+        end
+        test -n "$new"; or continue
+        test "$new" = -; and set new ""
+        # the file or folder name itself is what it shows without a name of your own
+        test "$new" = "$items_base[$i]"; and set new ""
+        if test -n "$new"
+            if not alias_valid "$new"
+                warn "not a usable name"
+                continue
+            end
+            if test "$new" = "$items_cur[$i]"
+                info "unchanged"
+                continue
+            end
+            # the name has to point at one entry only
+            set -l clash 0
+            for j in (seq (count $items_key))
+                test $j -eq $i; and continue
+                test "$items_shown[$j]" = "$new"; and set clash 1
+            end
+            if test $clash -eq 1
+                warn "'$new' is taken"
+                continue
+            end
+        end
+        if tracked_set_alias $dirfile $place "$new"
+            set -g items_cur[$i] "$new"
+            if test -n "$new"
+                set -g items_shown[$i] $new
+                info "$items_base[$i]: $new"
+            else
+                set -g items_shown[$i] $items_base[$i]
+                info "$items_base[$i]: name removed"
+            end
+        else
+            warn "failed: $items_base[$i]"
         end
     end
 end
@@ -2030,8 +2145,8 @@ function dir_uses
         end
     end
     if test $in_de -eq 1
-        echo "Some are saved in a desktop's folder, so they are restored only for that desktop."
-        echo "To share them, their copies move to $layout_backup/ and only the desktops you pick restore them."
+        echo "Some are in a desktop's folder (restored only for it)."
+        echo "To share them, their copies move to $layout_backup/."
     end
     choose_uses $word $cur; or return 0
     set -l uses $picked_uses
@@ -2204,7 +2319,7 @@ function de_add
             de_dir_name $notes $names[$i] >/dev/null; and set mark "   (already in the notes)"
             printf '  %d) %-10s %s%s\n' $i $names[$i] $paths[$i] $mark
         end
-        echo "  p) none of these: type a path instead"
+        echo "  p) none: type a path"
         ask "Choose [1-"(count $names)", p; Enter = cancel]: "; or return 1
         if test -z "$reply"
             echo "cancelled"
@@ -2212,7 +2327,7 @@ function de_add
         end
         set choice (string lower -- $reply)
     else
-        echo "Could not tell which desktop you use from ~/.config (nothing known was found)."
+        echo "No known desktop found in ~/.config."
     end
 
     set -l de ""
@@ -2227,7 +2342,7 @@ function de_add
             set -a lives $cfg/$r
         end
     else if contains -- $choice p path
-        ask "Path of its config folder or file (type it, or drag it here; Enter = cancel): "; or return 1
+        ask "Path of its config (drag it here; Enter = cancel): "; or return 1
         set -l p (string trim -c "'\"" -- $reply)
         set p (string replace -r -- '^~' "$HOME" $p)
         if test -z "$p"
@@ -2254,7 +2369,7 @@ function de_add
         set de $ex
         info "'$de' is already in the notes: adding to it"
     else if not string match -qr '^[A-Za-z][A-Za-z0-9._-]*$' -- $de
-        warn "'$de' is not a good desktop name (start with a letter; letters, digits, . _ - only)"
+        warn "'$de' is not a good desktop name (letters, digits, . _ - only)"
         return 1
     end
     set -l delc (string lower -- $de)
@@ -2270,7 +2385,7 @@ function de_add
     end
 
     echo
-    echo "Config to back up for $de (saved under $layout_de/$de/, restored only when $de is chosen):"
+    echo "Config to back up for $de (saved under $layout_de/$de/):"
     for lp in $lives
         if is_tracked $lp
             echo "  ~/"(string replace -- "$HOME/" '' $lp)"   (already tracked)"
@@ -2285,8 +2400,8 @@ function de_add
         for i in (seq (count $extra))
             printf '  %d) ~/.config/%s\n' $i $extra[$i]
         end
-        echo "(a thing several desktops share can be limited to them later with: sync-notes.sh dir uses)"
-        ask "Add which to $de? (numbers like 1,3-4, all; Enter = none): "; or return 1
+        echo "(shared things can be limited to desktops later: dir uses)"
+        ask "Add which to $de? (1,3-4 / all; Enter = none): "; or return 1
         if test -n "$reply"
             set -l idx (parse_selection (string replace -ra '\s+' ',' -- $reply) (count $extra))
             for k in $idx
@@ -2314,26 +2429,26 @@ function de_add
     set -l do_share 0
     if test (count $share_name) -gt 0
         echo
-        echo "Already backed up in $layout_backup/, restored only for other desktops:"
+        echo "In $layout_backup/, restored only for other desktops:"
         for i in (seq (count $share_name))
             echo "  $share_name[$i]   (now: $share_tags[$i])"
         end
-        yes_no "Does $de use them too? (it is added to their desktops; nothing is moved)" y; and set do_share 1
+        yes_no "Does $de use them too?" y; and set do_share 1
     end
     set -l want_exec 0
-    yes_no "Make the .sh and .py files in those folders executable when restored?" y; and set want_exec 1
-    ask "Packages to install for $de (names separated by spaces; Enter = none): "; or return 1
+    yes_no "Make .sh and .py files executable when restored?" y; and set want_exec 1
+    ask "Packages for $de (space separated; Enter = none): "; or return 1
     set -l pkgs (string split -n ' ' -- (string replace -a , ' ' -- $reply))
 
     if test $dry -eq 1
-        info "[dry-run] would create $layout_de/$de with pre.fish and post.fish and track the config above"
+        info "[dry-run] would create $layout_de/$de and track the config above"
         return 0
     end
 
     mkdir -p $notes/$layout_de/$de
     de_starter $notes/$layout_de/$de/pre.fish pre $de
     de_starter $notes/$layout_de/$de/post.fish post $de
-    info "$layout_de/$de is ready (edit pre.fish / post.fish for its own setup steps)"
+    info "$layout_de/$de is ready (edit its pre.fish / post.fish)"
 
     set -l hdr "# ---- $layout_de/$de (restored only when $de is chosen in initual-setup.sh)"
     if test -f $dirfile; and not grep -qxF -- $hdr $dirfile
@@ -2370,10 +2485,9 @@ function de_add
     end
 
     echo
-    info "setup will now list '$de'. Auto-detect picks it when '$delc' is in the desktop name of the session"
-    info "(\$XDG_CURRENT_DESKTOP / \$DESKTOP_SESSION); otherwise choose it from the list."
+    info "'$de' will be listed in the setup"
     if yes_no "Copy the config into the notes now? (a sync without the git step)" y
-        fish $self --sync --no-git
+        fish $self --sync --no-git --quiet
     end
 end
 
@@ -2467,7 +2581,7 @@ function do_migrate
         test "$old_l[$i]" = "$new_l[$i]"; or set n_moves (math $n_moves + 1)
     end
     if test $n_moves -eq 0 -a (count $hooks) -eq 0
-        info "tracked.conf is already in the Backup / Desktop Environment layout, nothing to migrate"
+        info "tracked.conf is already in the new layout, nothing to migrate"
         return 0
     end
 
@@ -2538,7 +2652,7 @@ function do_migrate
         mkdir -p (dirname $dst)
         if test -e $dst
             rm -f $h
-            info "$layout_de/$mig_de_result/$kind.fish is already there, removed additional-scripts/de/"(basename $h)
+            info "$layout_de/$mig_de_result/$kind.fish exists, removed additional-scripts/de/"(basename $h)
         else
             mv $h $dst
             info "moved hook additional-scripts/de/"(basename $h)" -> $layout_de/$mig_de_result/$kind.fish"
@@ -2620,7 +2734,7 @@ function do_migrate
     end
 
     echo
-    info "migrated. Run sync-notes.sh to refresh the copies; git will see the moves as renames."
+    info "migrated. Run sync-notes.sh to refresh the copies."
 end
 
 # ================================================================ menus
@@ -2667,7 +2781,7 @@ function add_menu
     echo "  2) flatpak"
     echo "  3) snap"
     echo "  4) Add by name (a package that search does not find)"
-    echo "  5) pipx (a PyPI name, or pipx:git+https://... for an app that is not on PyPI)"
+    echo "  5) pipx"
     echo "  6) git repo (URL, cloned to ~/Documents)"
     echo "  0) Back"
     ask "Choose: "; or return 0
@@ -2685,7 +2799,7 @@ function add_menu
         case 4
             pkg_add_name
         case 5
-            ask "pipx app(s): a PyPI name, or a git address / path (spaces or commas; Enter = cancel): "; or return 0
+            ask "pipx app(s): PyPI name or git address (Enter = cancel): "; or return 0
             set -l w (string split -n ' ' -- (string replace -a , ' ' -- $reply))
             test (count $w) -gt 0; and pkg_add_name pipx:$w
         case 6
@@ -2705,7 +2819,7 @@ function pkg_menu
         echo "  3) Remove packages"
         echo "  4) Add what is installed here but not listed"
         echo "  5) Install everything in the list now"
-        echo "  6) Rename a package (give any entry a name of your own)"
+        echo "  6) Rename package(s)"
         echo "  7) Record the install script of a git repo (install.sh...)"
         echo "  0) Back"
         ask "Choose: "; or return 0
@@ -2739,13 +2853,19 @@ function dir_menu
         echo "  1) List"
         echo "  2) Add a folder or file"
         echo "  3) Remove one"
-        echo "  4) Choose which desktops use one (rofi...)"
+        echo "  4) Choose which files/dir belong to which de"
         echo "  5) Add a desktop environment (scans ~/.config)"
+        echo "  6) Rename directories or files"
         echo "  0) Back"
         ask "Choose: "; or return 0
         switch $reply
             case 1
                 dir_list
+                while true
+                    ask "Filter (words like mango, sddm, private; Enter = back): "; or break
+                    test -n "$reply"; or break
+                    dir_list "$reply"
+                end
             case 2
                 dir_add
             case 3
@@ -2754,6 +2874,8 @@ function dir_menu
                 dir_uses
             case 5
                 de_add
+            case 6
+                dir_rename
             case 0 ''
                 return 0
         end
@@ -2807,7 +2929,7 @@ function usage
     sed -n '2,/^$/p' $self | string replace -r '^# ?' ''
 end
 
-# manage_cli GROUP SUB [ARG] : sync-notes.sh pkg list|search|add|remove|export|install, dir list|add|remove
+# manage_cli GROUP SUB [ARG] : sync-notes.sh pkg list|search|add|remove|export|install, dir list|add|remove|rename|uses|de
 function manage_cli
     need_lib; or return 1
     switch "$argv[1]"
@@ -2839,13 +2961,15 @@ function manage_cli
         case dir
             switch "$argv[2]"
                 case list
-                    dir_list
+                    dir_list "$argv[3]"
                 case add
                     dir_add "$argv[3]"
                 case remove rm
                     dir_remove
                 case uses
                     dir_uses
+                case rename
+                    dir_rename "$argv[3]" "$argv[4]"
                 case de
                     de_add
                 case ''
@@ -2896,7 +3020,7 @@ function delmode_label
         case mirror
             echo "mirror   - copies match live exactly; deleted files are gone"
         case archive
-            echo "archive  - like mirror, but deleted files go to a trash folder first (kept $archive_days days)"
+            echo "archive  - like mirror, but deleted files go to trash first ($archive_days days)"
         case keep
             echo "keep     - never delete anything, only add and update"
     end
@@ -3028,7 +3152,7 @@ else if not contains -- --sync $argv; and not string match -q -- '--deletes=*' $
         echo "  5) Choose how deleted files are handled   (now: $delmode)"
         set maxopt 5
         if test $old_layout -gt 0
-            echo "  6) Move the notes to the new layout (Backup / Desktop Environment)   (still to move: $old_layout)"
+            echo "  6) Migrate notes to the new layout ($old_layout left)"
             set maxopt 6
         end
         read -P "Choose [1-$maxopt, Enter = 1]: " choice
@@ -3191,8 +3315,7 @@ function pull
                 set -l n_rm (count $removed_entries)
                 if test $n_rm -gt 0
                     if test $delmode = mirror; and test $force -eq 0; and removal_is_heavy $n_rm $n_old
-                        warn "kept old copy of $dst: this sync would delete $n_rm of $n_old items (30%+ or everything)."
-                        warn "if that is intended run with --force, or switch to archive mode (--set-deletes)"
+                        warn "kept $dst: sync would delete $n_rm of $n_old items (use --force or archive mode)"
                         rm -rf $tmp
                         return 1
                     end
@@ -3219,14 +3342,14 @@ function pull
             return 1
         end
     end
-    info "$src -> $dst"
+    test $quiet -eq 1; or info (string replace -- $HOME '~' $src)" -> "(string replace -- "$notes/" '' $dst)
 end
 
 # ---------------------------------------------------------------- tracked folders
 # Everything listed in additional-scripts/tracked.conf (config.fish, ghostty, Keypass,
 # .passwords, Music ... and whatever you add with the manager), each saved as Backup/<path>
 # or Desktop Environment/<DE>/<path>.
-info "deleted files: $delmode mode"
+test $quiet -eq 0 -a $delmode != archive; and info "deleted files: $delmode mode"
 if test $dry -eq 0
     gitignore_add '.sync.*/'
     gitignore_add '*.sync-tmp'
@@ -3253,7 +3376,7 @@ for line in (tracked_list $extras/tracked.conf)
         end
     end
     if not tracked_name_ok $name
-        warn "tracked.conf: '$name' is not in the Backup / Desktop Environment layout, skipped (run: sync-notes.sh --migrate)"
+        warn "tracked.conf: '$name' skipped (old layout, run --migrate)"
         continue
     end
     # a Backup entry that only some desktops use (de=): left alone on a machine that uses none of them,
@@ -3296,7 +3419,7 @@ function git_backup
     set bad (git -C $notes diff --cached --name-only | grep -iE '\.kdbx$|(^|/)\.passwords(/|$)|recovery-codes|\.(mp4|mkv|webm|mov|avi|mp3|flac|wav|m4a|ogg)$')
     if test (count $bad) -gt 0
         git -C $notes reset -q
-        warn "git backup aborted, these files must not be committed (fix .gitignore):"
+        warn "git aborted, secret/media files staged (fix .gitignore):"
         printf '    %s\n' $bad
         return 1
     end

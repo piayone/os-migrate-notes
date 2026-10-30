@@ -18,11 +18,13 @@ os-migrate-notes/
 ├── Desktop Environment/      one folder per desktop; the folder name is the desktop's name
 │   ├── Kde/
 │   └── mango/                 each can hold its own files plus pre.fish / post.fish
+├── System/                   files outside your home folder, same paths as on the system (restored with sudo)
+│   └── etc/..., usr/local/bin/...
 └── additional-scripts/       helper scripts and lists (below)
     └── test-scripts/         dry-run and wallpaper tools (below)
 ```
 
-`Backup/` and `Desktop Environment/<DE>/` mirror your home folder: `~/.config/fish/config.fish` is stored as `Backup/.config/fish/config.fish`.
+`Backup/` and `Desktop Environment/<DE>/` mirror your home folder: `~/.config/fish/config.fish` is stored as `Backup/.config/fish/config.fish`. `System/` mirrors the root of the system instead: `/etc/sddm.conf.d` is stored as `System/etc/sddm.conf.d`.
 
 ---
 
@@ -77,6 +79,7 @@ Run it from a terminal for a small menu (Enter = normal sync), or let the timer 
 ./sync-notes.sh                # sync everything, then commit and push
 ./sync-notes.sh --dry-run      # only show what would be replaced
 ./sync-notes.sh --no-git       # sync but skip commit and push
+./sync-notes.sh --quiet        # do not list every copied file
 ./sync-notes.sh --backup       # make a full copy for a USB drive or phone
 ./sync-notes.sh --manage       # package and folder manager
 ./sync-notes.sh --set-deletes  # choose mirror / archive / keep
@@ -89,7 +92,12 @@ Good to know:
 - **Delete modes.** `mirror` makes copies match live files exactly (with a mass-delete guard), `archive` moves deleted files to a trash folder first and purges them after 60 days, `keep` never deletes.
 - **Safety.** If a live source is missing, the old copy is kept. Folders are copied to a temp location and swapped in only on success. The git commit is refused if a secret or media file (`.kdbx`, `.passwords`, audio, video...) is about to be committed.
 - **Backup copy.** `--backup` builds `~/Documents/os-migrate-notes-backup` with everything except git files, keeping the 3 previous versions.
-- **Manager commands.** `pkg list|search|add|remove|export|install|script|rename` edit `packages.conf`; `dir list|add|remove|de|uses` edit `tracked.conf` and the desktop folders.
+- **Manager commands.** `pkg list|search|add|remove|export|install|script|rename` edit `packages.conf`; `dir list|add|remove|rename|de|uses` edit `tracked.conf` and the desktop folders.
+- **Adding a folder or file** (`dir add`) asks a few short questions:
+  - *Only for some desktops?* No (default) saves it in `Backup/` for every machine. Yes shows the desktop list: one desktop saves it under `Desktop Environment/<name>/`, several keep it in `Backup/` but restore it only for those desktops.
+  - *Can other users read it?* Answering no locks the copy down to your user.
+  - *Make the file(s) executable?*, *Leave anything else out?*, then *Keep it out of git?* (the files are still copied into the notes and the USB backup, git just never sees them). These are separate: locking a file down does not keep it out of git, and the other way round.
+  - *Sync it now?* runs a quiet sync without the git step.
 - **Git URL** is stored in `~/.config/os-migrate-notes/git-url`, outside the notes, so it is never synced.
 
 ### pkg-track.fish
@@ -175,5 +183,4 @@ Helpers for going through installed Wallpaper Engine workshop items with `linux-
 | `wpe-review.sh` | Goes through each item one at a time with a live preview: Enter/`y` keeps it, `n` rejects it, `o` opens its Steam workshop page, `q` quits and saves progress. `--reset` starts over. |
 | `test-wpe.sh` | An older fish version of the review loop. Previews each item, then asks keep or reject and logs the rejected IDs. It first stops the mango WPE helper scripts and running engine instances. |
 
-`wpe-review.sh` writes its lists in the folder you run it from, so run it from `test-scripts/` to keep them there.# os-migrate-notes
-# os-migrate-notes
+`wpe-review.sh` writes its lists in the folder you run it from, so run it from `test-scripts/` to keep them there.
