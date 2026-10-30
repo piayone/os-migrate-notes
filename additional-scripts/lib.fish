@@ -328,7 +328,7 @@ function pipx_installed
 end
 
 # ---- names you give to entries (any section)
-# Any line of packages.conf can carry   name=ALIAS   (no spaces). The first word of the line stays what
+# Any line of packages.conf can carry   name=ALIAS   (any text; spaces etc. are stored as %20 ...). The first word of the line stays what
 # it was (the package name, flatpak id, git address or pipx spec), so installing and tracking do not
 # change; the alias is what the manager shows, and remove / uninstall / list accept it or the original.
 
@@ -336,7 +336,7 @@ end
 function entry_alias
     for t in $argv
         if string match -q -- 'name=*' $t
-            string replace -- 'name=' '' $t
+            alias_decode (string replace -- 'name=' '' $t)
             return 0
         end
     end
@@ -369,9 +369,18 @@ function conf_alias
     return 1
 end
 
-# alias_valid NAME : a name you may give (letters, digits and . _ + - ; no spaces)
+# alias_valid NAME : a name you may give: any text, but not empty, not just "-" (that clears the name)
+# and without control characters
 function alias_valid
-    string match -qr '^[A-Za-z0-9][A-Za-z0-9._+-]*$' -- $argv[1]
+    set -l n (string trim -- $argv[1])
+    test -n "$n"; or return 1
+    test "$n" != -; or return 1
+    not string match -qr '[[:cntrl:]]' -- $n
+end
+
+# alias_alt NAME : NAME for the space separated items_alt lists (its spaces become no-break spaces)
+function alias_alt
+    string replace -a ' ' \u00a0 -- $argv[1]
 end
 
 # conf_set_token FILE SECTION KEY TOKENNAME VALUE : set (or, with an empty VALUE, remove) the TOKENNAME=VALUE
@@ -412,7 +421,7 @@ end
 
 # conf_set_alias FILE SECTION KEY ALIAS : give the entry the name ALIAS (empty ALIAS takes the name away)
 function conf_set_alias
-    conf_set_token $argv[1] $argv[2] $argv[3] name $argv[4]
+    conf_set_token $argv[1] $argv[2] $argv[3] name (alias_encode "$argv[4]")
 end
 
 # pipx_ask_name FILE KEY : only with a terminal. For an app that does not come from PyPI, offer to give
@@ -427,21 +436,21 @@ function pipx_ask_name
     test -z "$(conf_alias $file pipx $key)"; or return 0
     set -l guess (pipx_basename $spec)
     echo
-    echo "  '$guess' does not come from PyPI, so its entry in packages.conf is the whole address:"
+    echo "  '$guess' is not on PyPI, so it is listed by its address:"
     echo "    $spec"
     while true
-        read -P "  Give it a name? (type one, e.g. $guess; Enter = keep the address): " -l name; or return 0
+        read -P "  Name for it? (e.g. $guess; Enter = no name): " -l name; or return 0
         set name (string trim -- $name)
         test -n "$name"; or return 0
         if not alias_valid $name
-            warn "use letters, digits and . _ + - only (no spaces)"
+            warn "not a usable name"
             continue
         end
         if conf_name_taken $file $name
-            warn "'$name' is already used by another entry"
+            warn "'$name' is taken"
             continue
         end
-        conf_set_alias $file pipx $key $name; and info "named: $name  (installs from $spec)"
+        conf_set_alias $file pipx $key $name; and info "named: $name"
         return 0
     end
 end
@@ -1081,7 +1090,7 @@ end
 
 # ================================================================ tracked.conf
 # One entry per line:   live path | place in the notes | options
-# Options (space separated): exclude=PATTERN (repeatable)  private  optional  exec  de=NAME[,NAME]
+# Options (space separated): exclude=PATTERN (repeatable)  private  optional  exec  de=NAME[,NAME]  name=ALIAS
 # The place is Backup/<path> or Desktop Environment/<DE>/<path> (see "layout of the notes" above).
 
 # tracked_list CONF : prints  live<TAB>name<TAB>options  per entry (~ is expanded)
@@ -1157,6 +1166,8 @@ function tracked_header
         '#               de=NAME[,NAME]   for a Backup/ entry that only some desktops use (rofi, ...): it stays' \
         '#                                in Backup/, but is restored only when one of those desktops is' \
         '#                                chosen (set it with sync-notes.sh dir uses)' \
+        '#               name=ALIAS       a name of your own, shown in the NAME column of the lists' \
+        '#                                (any text: spaces are written as %20; set it with sync-notes.sh dir rename)' \
         '#' \
         '# Desktop environments: the desktops offered by initual-setup.sh are the folders inside' \
         '# "Desktop Environment/" in the notes. Put pre.fish (runs before the configs are restored)' \
@@ -1278,5 +1289,52 @@ function tracked_update
         end
         set -a out $l
     end
+    printf '%s\n' $out >$conf
+end
+
+# alias_encode TEXT / alias_decode TEXT : a name of your own may hold any text, but tracked.conf
+# separates options by spaces and lines by | and #, so those (and %) are written as %20 %7C %23 %25
+# in the file and turned back when shown.
+function alias_encode
+    string replace -a '%' '%25' -- $argv[1] | string replace -a ' ' '%20' | string replace -a '|' '%7C' | string replace -a '#' '%23'
+end
+
+function alias_decode
+    string replace -a '%20' ' ' -- $argv[1] | string replace -a '%7C' '|' | string replace -a '%23' '#' | string replace -a '%25' '%'
+end
+
+# tracked_set_alias CONF PLACE ALIAS : give the entry saved at PLACE the name ALIAS (name=ALIAS option,
+# shown in the NAME column of the lists). An empty ALIAS takes the name away. Its other options stay.
+# Status 1 when there is no entry at that place.
+function tracked_set_alias
+    set -l conf $argv[1]
+    set -l place $argv[2]
+    set -l nick $argv[3]
+    set -l out
+    set -l found 1
+    for l in (cat $conf)
+        set -l c (string replace -r '(^|\s)#.*$' '' -- $l)
+        set -l f (string split '|' -- $c)
+        if set -q f[2]; and test (string trim -- $f[2]) = "$place"
+            set -l live (string trim -- $f[1])
+            set -l opts
+            if set -q f[3]
+                for o in (string split -n ' ' -- (string trim -- $f[3]))
+                    string match -q -- 'name=*' $o; or set -a opts $o
+                end
+            end
+            if test -n "$nick"
+                set -l enc (alias_encode "$nick")
+                set -a opts "name=$enc"
+            end
+            set -l row "$live | $place"
+            test (count $opts) -gt 0; and set row "$row | "(string join ' ' -- $opts)
+            set -a out $row
+            set found 0
+            continue
+        end
+        set -a out $l
+    end
+    test $found -eq 0; or return 1
     printf '%s\n' $out >$conf
 end
