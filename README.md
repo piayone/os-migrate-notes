@@ -1,6 +1,6 @@
 # os-migrate-notes
 
-Notes, configs and scripts for moving to a fresh Linux install (Arch/CachyOS first, but Debian/Ubuntu, Fedora and openSUSE are handled too).
+Personal notes to migrate setup on fresh install
 
 The idea is a loop:
 
