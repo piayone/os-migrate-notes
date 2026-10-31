@@ -1890,12 +1890,12 @@ function git_ignore_dir
         set -l whole 0
         set -l keep_words
         echo
-        echo "What should git NOT track in this folder?"
+        echo "Choose files/directories to get EXCLUDED from git (they are still copied into the notes directory)"
         echo "  Separate with spaces or commas. Use 'quotes' for names with spaces."
         echo "    png jpg      every file of that type"
         echo "    cache.db     a file or folder with that name (searched in the folder)"
         echo "    logs/*.log   a path inside the folder"
-        ask "Not tracked (Enter = the whole folder, q = cancel): "; or return 1
+        ask "EXCLUDE (names, *.ext or paths; Enter = the whole folder, q = cancel): "; or return 1
         test "$reply" = q; and return 1
 
         set -l words (string split -n ' ' -- (string replace -a , ' ' -- $reply))
@@ -2494,8 +2494,8 @@ function dir_add
             yes_no "Rewrite /home/... to the new home and user when restored?" y; and set -a opts rehome
         end
     end
-    echo "Anything listed here is NOT copied into the notes folder at all (git is asked about separately)."
-    ask "Don't copy (names, *.ext or paths; Enter = copy everything): "; or return 1
+    echo "Choose files/directories to get EXCLUDED from the notes directory (git is asked about separately)"
+    ask "EXCLUDE (names, *.ext or paths; Enter = copy everything): "; or return 1
     for pat in (gi_split "$reply" $p)
         set pat (string trim -c "'\"" -- (string trim -- $pat))
         test -n "$pat"; or continue
@@ -2521,7 +2521,13 @@ function dir_add
     # a new desktop gets its folder right away, so the setup already lists it
     if test -n "$picked_de"; and not test -d $notes/$layout_de/$picked_de
         mkdir -p $notes/$layout_de/$picked_de
-        info "new desktop '$picked_de': pre.fish / post.fish go in $layout_de/$picked_de"
+        de_starter $notes/$layout_de/$picked_de/pre.fish pre $picked_de
+        de_starter $notes/$layout_de/$picked_de/post.fish post $picked_de
+        info "new desktop '$picked_de' created"
+        echo "  Open pre.fish / post.fish if you want the setup to do anything extra for $picked_de:"
+        echo "    pre.fish    runs BEFORE the configs are restored (install the desktop's packages...)"
+        echo "    post.fish   runs AFTER they are restored (enable a service, manual steps...)"
+        echo "  They are in: "(string replace -- "$HOME/" '~/' $notes)"/$layout_de/$picked_de/"
     end
 
     # keep it out of git? (separate from "secrets": the files are still copied into the
@@ -2910,7 +2916,22 @@ function de_add
         echo "Found in ~/.config:"
         for i in (seq (count $names))
             set -l mark ""
-            de_dir_name $notes $names[$i] >/dev/null; and set mark "   (already in the notes)"
+            if de_dir_name $notes $names[$i] >/dev/null
+                set -l n_used 0
+                for tl in (tracked_list $dirfile)
+                    set -l t (string split \t -- $tl)
+                    if test (string lower -- "$(de_of_name $t[2])") = $names[$i]
+                        set n_used (math $n_used + 1)
+                    else if set -q t[3]; and contains -- $names[$i] (de_tags (string split -n ' ' -- $t[3]))
+                        set n_used (math $n_used + 1)
+                    end
+                end
+                if test $n_used -gt 0
+                    set mark "   (set up: $n_used tracked)"
+                else
+                    set mark "   (folder exists, nothing tracked yet)"
+                end
+            end
             printf '  %d) %-10s %s%s\n' $i $names[$i] $paths[$i] $mark
         end
         echo "  p) none: type a path"
@@ -3042,7 +3063,11 @@ function de_add
     mkdir -p $notes/$layout_de/$de
     de_starter $notes/$layout_de/$de/pre.fish pre $de
     de_starter $notes/$layout_de/$de/post.fish post $de
-    info "$layout_de/$de is ready (edit its pre.fish / post.fish)"
+    info "$layout_de/$de is ready"
+    echo "  Open these two files if you want the setup to do anything extra for $de:"
+    echo "    pre.fish    runs BEFORE the configs are restored (install the desktop's packages...)"
+    echo "    post.fish   runs AFTER they are restored (enable a service, manual steps...)"
+    echo "  They are in: "(string replace -- "$HOME/" '~/' $notes)"/$layout_de/$de/"
 
     set -l hdr "# ---- $layout_de/$de (restored only when $de is chosen in initual-setup.sh)"
     if test -f $dirfile; and not grep -qxF -- $hdr $dirfile
@@ -3055,7 +3080,34 @@ function de_add
     for lp in $all_live
         set -l opts
         test $want_exec -eq 1 -a -d $lp -a ! -L $lp; and set opts exec
-        track_add $lp (tracked_name_for $lp $de) $opts
+        set -l nm (tracked_name_for $lp $de)
+        set -l exs
+        set -l want_gi 0
+        # a folder that is not tracked yet: ask what is not copied and what git must not track
+        if test -d $lp -a ! -L $lp; and not is_tracked $lp
+            set -l shown_lp (string replace -- "$HOME/" '~/' $lp)
+            echo
+            set_color --bold; echo $shown_lp; set_color normal
+            echo "  Choose files/directories to get EXCLUDED from the notes directory (git is asked next)"
+            ask "  EXCLUDE (names, *.ext or paths; Enter = copy everything): "; or return 1
+            for pat in (gi_split "$reply" $lp)
+                set pat (string trim -c "'\"" -- (string trim -- $pat))
+                test -n "$pat"; or continue
+                exclude_check $lp $pat; or continue
+                for r in $ex_result
+                    set -a exs "exclude="(string replace -a ' ' '?' -- $r)
+                end
+            end
+            yes_no "  Keep (part of) it out of git? (it is still copied into the notes)" n; and set want_gi 1
+        end
+        set -a opts $exs
+        if track_add $lp $nm $opts; and test $want_gi -eq 1
+            set -l exp
+            for o in $exs
+                set -a exp (string replace -- 'exclude=' '' $o)
+            end
+            git_ignore_dir $lp $nm $exp
+        end
     end
 
     if test $do_share -eq 1
@@ -3450,6 +3502,8 @@ function dir_menu
         echo "  4) Choose which files/dir belong to which de"
         echo "  5) Add a desktop environment (scans ~/.config)"
         echo "  6) Rename directories or files"
+        echo "  7) Choose what is NOT copied into the notes"
+        echo "  8) Choose what git does NOT track"
         echo "  0) Back"
         ask "Choose: "; or return 0
         switch $reply
@@ -3470,8 +3524,262 @@ function dir_menu
                 de_add
             case 6
                 dir_rename
+            case 7
+                exclude_menu
+            case 8
+                git_menu
             case 0 ''
                 return 0
+        end
+    end
+end
+
+# ---------------------------------------------------------------- "not copied" and "not in git" menus
+# tracked_opts_of PLACE : the options of that entry in tracked.conf
+function tracked_opts_of
+    set -l t (string split \t -- (tracked_entry $argv[1]))
+    set -q t[3]; and echo $t[3]
+end
+
+# tracked_set_excludes PLACE [PATTERN...] : replace ALL exclude= options of that entry by these patterns
+function tracked_set_excludes
+    set -l place $argv[1]
+    set -e argv[1]
+    test -f $dirfile; or return 1
+    set -l out
+    set -l done 0
+    for line in (cat $dirfile)
+        if string match -qr '^\s*(#|$)' -- "$line"
+            set -a out "$line"
+            continue
+        end
+        set -l f (string split '|' -- "$line")
+        if test (count $f) -ge 2; and test (string trim -- "$f[2]") = "$place"
+            set -l opts
+            if set -q f[3]
+                for t in (string split -n ' ' -- (string trim -- "$f[3]"))
+                    string match -q -- 'exclude=*' $t; or set -a opts $t
+                end
+            end
+            for x in $argv
+                set -a opts "exclude=$x"
+            end
+            set -l nl (string trim -- "$f[1]")" | "(string trim -- "$f[2]")
+            test (count $opts) -gt 0; and set nl "$nl | "(string join ' ' -- $opts)
+            set -a out "$nl"
+            set done 1
+        else
+            set -a out "$line"
+        end
+    end
+    test $done -eq 1; or return 1
+    printf '%s\n' $out >$dirfile
+end
+
+# pick_one_tracked PROMPT : choose ONE tracked folder or file. Sets $t_live, $t_place, $t_opts.
+function pick_one_tracked
+    build_dir_items
+    if test (count $items_key) -eq 0
+        warn "nothing is tracked yet"
+        return 1
+    end
+    pick_items "$argv[1]"; or return 1
+    if test (count $picked) -gt 1
+        warn "pick one at a time"
+        return 1
+    end
+    set -l t (string split \t -- (tracked_entry $items_key[$picked[1]]))
+    set -g t_live $t[1]
+    set -g t_place $t[2]
+    set -g t_opts ""
+    set -q t[3]; and set -g t_opts $t[3]
+    return 0
+end
+
+# gitignore_rules_of NAME : the .gitignore lines of that tracked entry (nested entries are not included)
+function gitignore_rules_of
+    set -l gi $notes/.gitignore
+    test -f $gi; or return 0
+    set -l base "/"(gi_esc $argv[1])
+    set -l nested
+    for line in (tracked_list $dirfile)
+        set -l t (string split \t -- $line)
+        string match -q -- "$argv[1]/*" $t[2]; and set -a nested "/"(gi_esc $t[2])
+    end
+    for l in (cat $gi)
+        set -l body (string trim -- "$l")
+        string match -q -- '!*' "$body"; and set body (string sub -s 2 -- "$body")
+        if test "$body" = "$base"; or string match -q -- "$base/*" "$body"
+            set -l mine 1
+            for nb in $nested
+                if test "$body" = "$nb"; or string match -q -- "$nb/*" "$body"
+                    set mine 0
+                end
+            end
+            test $mine -eq 1; and echo $l
+        end
+    end
+end
+
+# exclude_menu : choose what is NOT copied into the notes (the exclude= list of one tracked folder)
+function exclude_menu
+    pick_one_tracked "Which folder or file?"; or return 0
+    set -l changed 0
+    while true
+        set -l ex
+        for o in (string split -n ' ' -- "$t_opts")
+            string match -q -- 'exclude=*' $o; and set -a ex (string replace -- 'exclude=' '' $o)
+        end
+        echo
+        set_color --bold
+        echo (string replace -- "$HOME/" '~/' $t_live)
+        set_color normal
+        if test (count $ex) -eq 0
+            echo "  Nothing is excluded: everything in it is copied into the notes directory."
+        else
+            echo "  EXCLUDED (not copied into the notes directory):"
+            for i in (seq (count $ex))
+                printf '    %3d) %s\n' $i $ex[$i]
+            end
+        end
+        echo
+        echo "  1) Exclude files/directories"
+        echo "  2) Add files/directories to track"
+        echo "  0) Back"
+        ask "Choose: "; or break
+        switch $reply
+            case 1
+                if not test -d $t_live -a ! -L $t_live
+                    warn "only a directory can have files/directories excluded. To stop backing up a single file: Folders and files to back up > Remove one"
+                    continue
+                end
+                # same tree as when a folder is added; what is already not copied is hidden from it
+                set -g gi_excl $ex
+                set -g gi_xf
+                for e in $gi_excl
+                    set -a gi_xf -not -path "*/$e" -not -path "*/$e/*"
+                end
+                tree_show $t_live
+                echo
+                echo "  Choose files/directories to get EXCLUDED from the notes directory"
+                echo "    png jpg      every file of that type"
+                echo "    cache.db     a file or folder with that name (searched in the folder)"
+                echo "    logs/*.log   a path inside the folder"
+                ask "  EXCLUDE (names, *.ext or paths; Enter = cancel): "; or break
+                test -n "$reply"; or continue
+                set -l added
+                for pat in (gi_split "$reply" $t_live)
+                    set pat (string trim -c "'\"" -- (string trim -- $pat))
+                    test -n "$pat"; or continue
+                    exclude_check $t_live $pat; or continue
+                    for r in $ex_result
+                        set r (string replace -a ' ' '?' -- $r)
+                        contains -- $r $ex $added; or set -a added $r
+                    end
+                end
+                test (count $added) -gt 0; or continue
+                if tracked_set_excludes $t_place $ex $added
+                    info "excluded "(count $added)" item(s) from the notes directory: "(string join ', ' -- $added)
+                    set changed 1
+                else
+                    warn "could not save it in tracked.conf"
+                end
+            case 2
+                if test (count $ex) -eq 0
+                    warn "nothing is excluded yet, so everything is already copied into the notes directory"
+                    continue
+                end
+                echo
+                echo "  Choose which EXCLUDED files/directories to track again (they will be copied into the notes directory)"
+                ask "  Choose (number(s) or all; Enter = cancel): "; or break
+                test -n "$reply"; or continue
+                set -l idx (parse_selection (string replace -ra '\s+' ',' -- $reply) (count $ex)); or continue
+                set -l keep
+                for i in (seq (count $ex))
+                    contains -- $i $idx; or set -a keep $ex[$i]
+                end
+                if tracked_set_excludes $t_place $keep
+                    info "now tracked again: "(count $idx)" item(s) will be copied into the notes directory"
+                    set changed 1
+                else
+                    warn "could not save it in tracked.conf"
+                end
+            case 0 ''
+                break
+        end
+        set -g t_opts (tracked_opts_of $t_place)
+    end
+    if test $changed -eq 1
+        echo
+        echo "The notes directory is updated at the next sync:"
+        echo "  - newly excluded files/directories are removed from it (in archive mode they go to the trash first)"
+        echo "  - files/directories you track again are copied into it"
+        yes_no "Sync now so the notes directory matches?" y; and fish $self --sync --no-git --quiet
+    end
+end
+
+# git_menu : choose what git does NOT track (the .gitignore rules of one tracked folder or file)
+function git_menu
+    pick_one_tracked "Which folder or file?"; or return 0
+    if not test -e $t_live -o -L $t_live
+        warn "it does not exist on this machine"
+        return 0
+    end
+    set -l is_dir 0
+    test -d $t_live -a ! -L $t_live; and set is_dir 1
+    set -l exs
+    for o in (string split -n ' ' -- "$t_opts")
+        string match -q -- 'exclude=*' $o; and set -a exs (string replace -- 'exclude=' '' $o)
+    end
+    while true
+        echo
+        set_color --bold
+        echo (string replace -- "$HOME/" '~/' $t_live)"   ($t_place)"
+        set_color normal
+        set -l rules (gitignore_rules_of $t_place)
+        if test (count $rules) -eq 0
+            echo "  Nothing is excluded from git: git tracks all of it."
+        else
+            echo "  EXCLUDED from git (.gitignore rules):"
+            printf '    %s\n' $rules
+            if test -d $notes/.git
+                set -l ign (git -C $notes ls-files -z -o -i --exclude-standard -- ":(literal)$t_place" 2>/dev/null | string split0)
+                echo "  "(count $ign)" file(s) here are excluded from git (still copied into the notes directory):"
+                printf '    %s\n' $ign | head -n 15
+                test (count $ign) -gt 15; and echo "    ... and "(math (count $ign) - 15)" more"
+            end
+        end
+        echo
+        if test $is_dir -eq 1
+            echo "  1) Exclude files/directories from git"
+        else
+            echo "  1) Exclude this file from git"
+        end
+        echo "  2) Add everything back to git tracking (removes all git exclusions for it)"
+        echo "  0) Back"
+        ask "Choose: "; or break
+        switch $reply
+            case 1
+                if test $is_dir -eq 1
+                    git_ignore_dir $t_live $t_place $exs
+                else
+                    gitignore_drop_folder $t_place
+                    gitignore_add "/"(gi_esc $t_place)
+                    if test -d $notes/.git; and git -C $notes ls-files --error-unmatch -- $t_place >/dev/null 2>&1
+                        git -C $notes rm -r -q --cached -- $t_place
+                        info "git: stopped tracking $t_place (the next sync commits that)"
+                    end
+                    info "git will not track $t_place"
+                end
+            case 2
+                if test (count $rules) -eq 0
+                    info "nothing is excluded from git, it already tracks all of it"
+                else
+                    gitignore_drop_folder $t_place
+                    info "all git exclusions removed: git tracks all of it again (the next sync commits it)"
+                end
+            case 0 ''
+                break
         end
     end
 end
