@@ -716,6 +716,7 @@ end
 #   [native]   packages from the distro's own repos (pacman, apt, dnf, zypper)
 #   [flatpak]  flatpak apps by application id (the same on every distro)
 #   [snap]     snap packages by name (the same on every distro that has snapd)
+#   [cargo] [npm] [uv]  Rust crates (cargo install), global npm packages, uv tools: one name per line
 #   [pipx]     Python apps installed with pipx: a PyPI name, or a git/web address or path (the same on every
 #              distro)
 #   Any line can end in  name=ALIAS  to give the entry a name of your own (sync-notes.sh pkg rename).
@@ -862,6 +863,89 @@ function git_dest
     echo $HOME/Documents/(basename (string trim -r -c / -- $argv[1]) .git)
 end
 
+# ================================================================ cargo, npm, uv
+# cargo, npm (global) and uv tool. Entries live in packages.conf as [cargo], [npm], [uv].
+# To add another manager: put its name in xm_list and add a case line in xm_now, xm_install, xm_remove.
+set -g xm_list cargo npm uv
+set -g new_xm
+
+function xm_have
+    type -q $argv[1]
+end
+
+# xm_now MGR : names the user installed with that manager
+function xm_now
+    switch $argv[1]
+        case cargo
+            cargo install --list 2>/dev/null | string match -rg '^(\S+) v\S+'
+        case npm
+            npm ls -g --depth=0 --parseable 2>/dev/null | tail -n +2 | string replace -r '.*/node_modules/' '' | string match -rv '^(npm|corepack)$'
+        case uv
+            uv tool list 2>/dev/null | string match -rg '^(\S+) v\S+'
+    end
+end
+
+function xm_installed
+    contains -- $argv[2] (xm_now $argv[1])
+end
+
+# xm_install MGR NAME... (npm -g needs a user-writable prefix, or sudo)
+function xm_install
+    set -l m $argv[1]
+    set -l names $argv[2..-1]
+    switch $m
+        case cargo
+            cargo install $names
+        case npm
+            npm install -g $names
+        case uv
+            for n in $names
+                uv tool install $n
+            end
+    end
+end
+
+function xm_remove
+    set -l m $argv[1]
+    set -l names $argv[2..-1]
+    switch $m
+        case cargo
+            cargo uninstall $names
+        case npm
+            npm uninstall -g $names
+        case uv
+            for n in $names
+                uv tool uninstall $n
+            end
+    end
+end
+
+# add_xm MGR NAME : write it to packages.conf and remember it for offer_install (sync-notes.sh)
+function add_xm
+    if conf_has $pkgfile $argv[1] $argv[2]
+        info "already in [$argv[1]]: $argv[2]"
+        return 0
+    end
+    conf_add $pkgfile $argv[1] $argv[2]
+    set -a new_xm $argv[1]:$argv[2]
+    info "added to [$argv[1]]: $argv[2]"
+end
+
+# xm_watch_paths MGR : files or folders that change when that manager installs or removes something
+function xm_watch_paths
+    switch $argv[1]
+        case cargo
+            set -l h $HOME/.cargo
+            test -n "$CARGO_HOME"; and set h $CARGO_HOME
+            echo $h/.crates.toml
+            echo $h/.crates2.json
+        case npm
+            npm root -g 2>/dev/null
+        case uv
+            uv tool dir 2>/dev/null
+    end
+end
+
 # install_packages FILE : install everything in the file that exists for this system
 function install_packages
     set -l file $argv[1]
@@ -872,6 +956,7 @@ function install_packages
     set -l sn
     set -l gits
     set -l git_inst
+    set -l xm_todo
     set -l to_install
     set -l skipped
     set -l failed
@@ -897,6 +982,11 @@ function install_packages
         end
         if test "$w[1]" = pipx
             set -a px (pipx_entry_spec $w[2] $toks)
+            continue
+        end
+        # cargo, npm and uv entries: collected here, installed below
+        if contains -- $w[1] $xm_list
+            set -a xm_todo $w[1]:$w[2]
             continue
         end
         if test "$w[1]" = git
@@ -1001,6 +1091,29 @@ function install_packages
             pipx_forget
         else
             warn "pipx is not installed (add python-pipx to [native]), pipx apps skipped: $px"
+        end
+    end
+
+    for m in $xm_list
+        set -l names
+        for e in $xm_todo
+            set -l p (string split -m1 : -- $e)
+            test "$p[1]" = $m; and set -a names $p[2]
+        end
+        test (count $names) -gt 0; or continue
+        if xm_have $m
+            set -l have (xm_now $m)
+            set -l todo
+            for a in $names
+                contains -- $a $have; or set -a todo $a
+            end
+            test (count $todo) -gt 0; or continue
+            info "installing "(count $todo)" $m packages"
+            for a in $todo
+                xm_install $m $a; or set -a failed "$a ($m)"
+            end
+        else
+            warn "$m is not installed (add it to [native]), $m packages skipped: $names"
         end
     end
 
@@ -1337,4 +1450,241 @@ function tracked_set_alias
     end
     test $found -eq 0; or return 1
     printf '%s\n' $out >$conf
+end
+
+# ================================================================ ssh for the notes repo
+# The notes repo gets its own key (~/.ssh/id_ed25519_os-migrate-notes). sync-notes.sh pushes with
+# that key in batch mode (no prompt, so the hourly timer can push), and ssh_setup makes it.
+set -g repo_ssh_key $HOME/.ssh/id_ed25519_os-migrate-notes
+
+# ssh_parse URL : prints "USER HOST PORT" for an ssh-style git address; status 1 for https/file/local
+#   git@gitlab.com:user/repo.git      ssh://git@host:2222/user/repo.git
+function ssh_parse
+    set -l u $argv[1]
+    if string match -q -- 'ssh://*' $u
+        set -l auth (string split -m1 / -- (string replace -- 'ssh://' '' $u))[1]
+        set -l user git
+        if string match -q -- '*@*' $auth
+            set -l ua (string split -m1 @ -- $auth)
+            test -n "$ua[1]"; and set user $ua[1]
+            set auth $ua[2]
+        end
+        set -l hp (string split -m1 : -- $auth)
+        test -n "$hp[1]"; or return 1
+        set -l port 22
+        set -q hp[2]; and string match -qr '^[0-9]+$' -- $hp[2]; and set port $hp[2]
+        echo $user $hp[1] $port
+        return 0
+    end
+    set -l m (string match -r '^([A-Za-z0-9._-]+)@([A-Za-z0-9.-]+):(?!//)' -- $u)
+    if set -q m[3]
+        echo $m[2] $m[3] 22
+        return 0
+    end
+    return 1
+end
+
+# ssh_url_from_https URL : https://github.com/user/repo(.git) -> git@github.com:user/repo.git
+function ssh_url_from_https
+    set -l m (string match -r '^https?://(?:[^@/]+@)?([^/]+)/(.+?)(?:\.git)?/?$' -- $argv[1])
+    set -q m[3]; or return 1
+    echo git@$m[2]:$m[3].git
+end
+
+# ssh_keys_page HOST : where the public key is added
+function ssh_keys_page
+    switch $argv[1]
+        case github.com
+            echo https://github.com/settings/ssh/new
+        case gitlab.com
+            echo https://gitlab.com/-/user_settings/ssh_keys
+        case bitbucket.org
+            echo https://bitbucket.org/account/settings/ssh-keys/
+        case codeberg.org
+            echo https://codeberg.org/user/settings/keys
+        case '*'
+            echo "the SSH keys page of your account on $argv[1]"
+    end
+end
+
+# ssh_yn PROMPT DEFAULT(y|n) : status 0 for yes (lib.fish has no yes_no of its own)
+function ssh_yn
+    set -l hint "[y/N]"
+    test "$argv[2]" = y; and set hint "[Y/n]"
+    read -P "$argv[1] $hint: " -l ans; or return 1
+    switch (string lower -- (string trim -- "$ans"))
+        case y yes
+            return 0
+        case n no
+            return 1
+        case ''
+            test "$argv[2]" = y
+        case '*'
+            return 1
+    end
+end
+
+# ssh_git_cmd : the ssh command git uses for the push. Batch mode (never waits for a password), a
+# host seen for the first time is remembered (a CHANGED host key is still refused), and the repo's
+# own key is used when it exists.
+function ssh_git_cmd
+    set -l c "ssh -o BatchMode=yes -o ConnectTimeout=15 -o StrictHostKeyChecking=accept-new"
+    test -f $repo_ssh_key; and set c "$c -i $repo_ssh_key -o IdentitiesOnly=yes"
+    echo $c
+end
+
+# ssh_trust_host HOST PORT : put the host key in known_hosts after showing its fingerprints
+function ssh_trust_host
+    set -l host $argv[1]
+    set -l port 22
+    set -q argv[2]; and set port $argv[2]
+    set -l q $host
+    test "$port" != 22; and set q "[$host]:$port"
+    if ssh-keygen -F $q >/dev/null 2>&1
+        info "$host is already trusted (known_hosts)"
+        return 0
+    end
+    set -l scan (ssh-keyscan -T 10 -p $port -t ed25519,ecdsa,rsa $host 2>/dev/null | string match -v '#*')
+    if test (count $scan) -eq 0
+        warn "could not read the host key of $host (offline, or not an ssh server?)"
+        return 1
+    end
+    echo "$host presented these host keys:"
+    printf '%s\n' $scan | ssh-keygen -lf - 2>/dev/null | string replace -r '^' '    '
+    echo "  Compare one with the fingerprint the site publishes (GitHub and GitLab list theirs in their docs)."
+    ssh_yn "Trust $host and remember it in ~/.ssh/known_hosts?" y; or return 1
+    mkdir -p $HOME/.ssh; and chmod 700 $HOME/.ssh
+    printf '%s\n' $scan >>$HOME/.ssh/known_hosts; and chmod 600 $HOME/.ssh/known_hosts
+    info "$host added to known_hosts"
+end
+
+# ssh_make_key : make the repo's key unless it exists
+function ssh_make_key
+    if test -f $repo_ssh_key
+        info "using the existing key $repo_ssh_key"
+        test -f $repo_ssh_key.pub; or ssh-keygen -y -f $repo_ssh_key >$repo_ssh_key.pub 2>/dev/null
+        return 0
+    end
+    mkdir -p $HOME/.ssh; and chmod 700 $HOME/.ssh
+    set -l comment "os-migrate-notes@"(hostname 2>/dev/null; or echo host)
+    echo "A new ed25519 key will be made just for this repo: $repo_ssh_key"
+    echo "  Without a passphrase the hourly sync can push by itself. With one, the sync can only push"
+    echo "  while ssh-agent has the key unlocked."
+    if ssh_yn "Protect the key with a passphrase?" n
+        ssh-keygen -t ed25519 -f $repo_ssh_key -C $comment; or return 1
+    else
+        ssh-keygen -q -t ed25519 -f $repo_ssh_key -C $comment -N ""; or return 1
+    end
+    info "key made: $repo_ssh_key"
+end
+
+# ssh_clip FILE : copy a file to the clipboard when a clipboard tool is there (status 0 when copied)
+function ssh_clip
+    if type -q wl-copy; and test -n "$WAYLAND_DISPLAY"
+        wl-copy <$argv[1]; and return 0
+    end
+    if test -n "$DISPLAY"
+        type -q xclip; and begin
+            xclip -selection clipboard <$argv[1]; and return 0
+        end
+        type -q xsel; and begin
+            xsel --clipboard --input <$argv[1]; and return 0
+        end
+    end
+    return 1
+end
+
+# ssh_test USER HOST PORT : can the repo key log in? ssh exits 255 for a connection or key problem;
+# GitHub answers "successfully authenticated" with status 1 (it gives no shell), GitLab with 0.
+function ssh_test
+    set -l out (ssh -T -p $argv[3] -i $repo_ssh_key -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=15 -o StrictHostKeyChecking=yes $argv[1]@$argv[2] 2>&1)
+    set -l st $status
+    printf '%s\n' $out | string replace -r '^' '    '
+    test $st -ne 255
+end
+
+# ssh_works USER HOST PORT : does the repo key already log in? (quiet, no prompts)
+function ssh_works
+    test -f $repo_ssh_key; or return 1
+    ssh -T -p $argv[3] -i $repo_ssh_key -o IdentitiesOnly=yes -o BatchMode=yes \
+        -o ConnectTimeout=15 -o StrictHostKeyChecking=yes $argv[1]@$argv[2] >/dev/null 2>&1
+    test $status -ne 255
+end
+
+# ssh_setup [URL [REPO_DIR]] : the whole setup, with questions (needs a terminal).
+#   1 an https address is switched to its ssh form   2 the host key is trusted   3 the repo's key is made
+#   4 the public key is shown (and copied) for you to add to your account   5 the login is tested
+#   6 REPO_DIR (a git folder) is told to use the key
+# Sets the global ssh_used_url to the address to use from now on. Status 0 when the login works.
+function ssh_setup
+    set -g ssh_used_url
+    set -l url $argv[1]
+    set -l repo_dir ""
+    set -q argv[2]; and set repo_dir $argv[2]
+    for t in ssh ssh-keygen ssh-keyscan
+        type -q $t; or begin
+            warn "$t is not installed (package openssh or openssh-client)"
+            return 1
+        end
+    end
+    isatty stdin; or begin
+        warn "the SSH setup needs a terminal"
+        return 1
+    end
+    if test -z "$url"
+        read -P "Repo address (git@gitlab.com:user/repo.git or https://github.com/user/repo; Enter = skip): " -l url
+        set url (string trim -- "$url")
+        test -n "$url"; or return 1
+    end
+    set -l p (string split ' ' -- (ssh_parse $url))
+    if test (count $p) -eq 0
+        set -l s (ssh_url_from_https $url)
+        if test -z "$s"
+            warn "cannot turn that address into an ssh address (use git@host:user/repo.git)"
+            return 1
+        end
+        echo "This repo is set up with https. Its ssh address is: $s"
+        ssh_yn "Switch to it?" y; or return 1
+        set url $s
+        set p (string split ' ' -- (ssh_parse $url))
+    end
+    set -g ssh_used_url $url
+    set -l user $p[1]
+    set -l host $p[2]
+    set -l port $p[3]
+
+    ssh_trust_host $host $port; or return 1
+    ssh_make_key; or return 1
+
+    echo
+    echo "Add this public key to your account on $host:"
+    echo
+    echo "    "(cat $repo_ssh_key.pub)
+    echo
+    echo "  "(ssh_keys_page $host)
+    ssh_clip $repo_ssh_key.pub; and echo "  (the key is copied to the clipboard)"
+    echo
+
+    set -l ok 1
+    for try in 1 2 3
+        read -P "Press Enter once it is added (s = skip the test): " -l r; or break
+        if string match -qri '^s' -- (string trim -- "$r")
+            warn "test skipped"
+            set ok 2
+            break
+        end
+        if ssh_test $user $host $port
+            info "ssh login to $host works"
+            set ok 0
+            break
+        end
+        warn "the login did not work yet. Is the key added to the right account? (a key with a passphrase also needs ssh-add)"
+    end
+
+    # plain `git push` by hand uses the same key
+    if test -n "$repo_dir"; and test -d $repo_dir/.git
+        git -C $repo_dir config core.sshCommand "ssh -i $repo_ssh_key -o IdentitiesOnly=yes"
+        info "git: $repo_dir uses the repo key for ssh"
+    end
+    test $ok -eq 0
 end

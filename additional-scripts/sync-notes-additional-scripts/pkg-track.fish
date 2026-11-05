@@ -17,13 +17,14 @@
 #                                  - a pipx watcher (user systemd path unit, when pipx is installed)
 #                                  - a snap watcher (user systemd path unit, when snap is installed)
 #                                  - a git watcher (new clones in ~/Documents)
+#                                  - cargo / npm / uv watchers (when those are installed)
 #   ./pkg-track.fish uninstall   (needs sudo) remove the triggers (packages.conf is left as it is)
 #   ./pkg-track.fish init        take a new baseline now, without touching packages.conf
 #   ./pkg-track.fish update      compare now (the triggers run this); --force allows a large removal
 #   ./pkg-track.fish status      show the baseline, the triggers and the last changes
 #   ./pkg-track.fish log         show the last 40 log lines
 #
-# Names listed in additional-scripts/pkg-ignore.conf are never added automatically (one name or
+# Names listed in additional-scripts/sync-notes-additional-scripts/pkg-ignore.conf are never added automatically (one name or
 # pattern per line, e.g. gtk4 or lib32-*). Created on the first init.
 #
 # Backup: after a change, packages.conf is committed and pushed on its own (see auto_backup).
@@ -32,7 +33,8 @@
 # Layout: lives in <notes>/additional-scripts/ next to lib.fish and packages.conf.
 #
 # Covered: pacman (any front end: paru, yay, pamac... they all call pacman), apt, dnf, zypper,
-# flatpak, snap (snap list, minus runtimes and base snaps), pipx and git. What counts as "installed by you":
+# flatpak, snap (snap list, minus runtimes and base snaps), pipx, cargo (cargo install --list),
+# npm (global packages), uv (uv tool list) and git. What counts as "installed by you":
 #   pacman  pacman -Qqe                 apt    apt-mark showmanual
 #   dnf     dnf repoquery --userinstalled      zypper  rpm -qa minus /var/lib/zypp/AutoInstalled
 # pipx apps are tracked by what "pipx install" was given (pipx list --json, package_or_url), so an app
@@ -45,12 +47,14 @@
 # pipx = path units on its venvs and bin folders, snap = on /var/lib/snapd/snaps, git = on ~/Documents.
 
 set here (realpath (dirname (status filename)))
-if test (basename $here) = additional-scripts
+if test (basename $here) = sync-notes-additional-scripts
+    set notes (dirname (dirname $here))
+else if test (basename $here) = additional-scripts
     set notes (dirname $here)
 else
     set notes $here
 end
-set extras $notes/additional-scripts
+set extras $here
 set pkgfile $extras/packages.conf
 set ignorefile $extras/pkg-ignore.conf
 set self (realpath (status filename))
@@ -174,6 +178,14 @@ function now_git
     return 0
 end
 
+# now_xm MGR : what that manager has installed (cargo, npm, uv), sorted; nothing when it is missing
+function now_xm
+    xm_have $argv[1]; or return 0
+    set -l raw (xm_now $argv[1])
+    test (count $raw) -gt 0; and printf '%s\n' $raw | sort -u
+    return 0
+end
+
 # pipx_venvs_dirs / pipx_bin_dirs : where pipx keeps its apps and puts their commands
 function pipx_venvs_dirs
     set -l out
@@ -218,7 +230,7 @@ function conf_name_for
             end
             continue
         end
-        if contains -- $sec flatpak snap git
+        if contains -- $sec flatpak snap git $xm_list
             if test "$w[2]" = "$want"
                 echo $w[2]
                 return 0
@@ -285,8 +297,18 @@ function do_init
         write_list $state/snap.txt (now_snap)
         set ok 1
     end
+    for m in $xm_list
+        xm_have $m; or continue
+        write_list $state/$m.txt (now_xm $m)
+        set ok 1
+    end
     test $ok -eq 1; or return 1
-    say "baseline recorded: "(count (cat $state/native.txt 2>/dev/null))" native, "(count (cat $state/flatpak.txt 2>/dev/null))" flatpak, "(count (cat $state/pipx.txt 2>/dev/null))" pipx, "(count (cat $state/snap.txt 2>/dev/null))" snap, "(count (cat $state/git.txt 2>/dev/null))" git repos (packages.conf not changed)"
+    set -l xm_tail
+    for m in $xm_list
+        test -f $state/$m.txt; and set -a xm_tail (count (cat $state/$m.txt))" $m"
+    end
+    test (count $xm_tail) -gt 0; and set xm_tail ", "(string join ', ' $xm_tail)
+    say "baseline recorded: "(count (cat $state/native.txt 2>/dev/null))" native, "(count (cat $state/flatpak.txt 2>/dev/null))" flatpak, "(count (cat $state/pipx.txt 2>/dev/null))" pipx, "(count (cat $state/snap.txt 2>/dev/null))" snap, "(count (cat $state/git.txt 2>/dev/null))" git repos$xm_tail (packages.conf not changed)"
 end
 
 # ================================================================ compare
@@ -314,6 +336,8 @@ function reconcile
                 pm_installed pipx $n; and continue
             case snap
                 pm_installed snap $n; and continue
+            case cargo npm uv
+                xm_installed $sec $n; and continue
             case '*'
                 flatpak info $n >/dev/null 2>&1; and continue
         end
@@ -372,7 +396,7 @@ function backup_pkgfile
     end
 
     set -l branch (git -C $notes rev-parse --abbrev-ref HEAD)
-    set -lx GIT_SSH_COMMAND "ssh -o BatchMode=yes -o ConnectTimeout=15"
+    set -lx GIT_SSH_COMMAND (ssh_git_cmd)
     set -lx GIT_TERMINAL_PROMPT 0
     if timeout 60 git -C $notes push -q -u origin $branch 2>/dev/null
         say "backup: packages.conf pushed to origin/$branch"
@@ -472,6 +496,22 @@ function do_update
             write_list $state/snap.now (now_snap)
             reconcile snap $state/snap.now $state/snap.txt $force; or set failed 1
         end
+    end
+
+    # cargo, npm, uv. An empty answer is not compared: a failed query must not look like "all removed".
+    for m in $xm_list
+        xm_have $m; or continue
+        if not test -f $state/$m.txt
+            write_list $state/$m.txt (now_xm $m)
+            continue
+        end
+        set -l cur (now_xm $m)
+        if test (count $cur) -eq 0; and test -s $state/$m.txt
+            say "$m: the list came back empty, not compared"
+            continue
+        end
+        write_list $state/$m.now $cur
+        reconcile $m $state/$m.now $state/$m.txt $force; or set failed 1
     end
 
     if test (count $added_all) -gt 0 -o (count $removed_all) -gt 0
@@ -619,6 +659,20 @@ function do_install
         set -a units pkg-track-snap.path
     end
 
+    for m in $xm_list
+        xm_have $m; or continue
+        set -l paths (xm_watch_paths $m)
+        test (count $paths) -gt 0; or continue
+        write_service
+        set -l body '[Unit]' "Description=Watch $m packages for changes" '' '[Path]'
+        for d in $paths
+            set -a body "PathChanged=$d"
+        end
+        set -a body 'Unit=pkg-track.service' '' '[Install]' 'WantedBy=default.target'
+        printf '%s\n' $body >$unit_dir/pkg-track-$m.path
+        set -a units pkg-track-$m.path
+    end
+
     if test (count $units) -gt 0
         systemctl --user daemon-reload
         systemctl --user enable --now $units
@@ -629,7 +683,7 @@ end
 
 function do_uninstall
     sudo rm -f $pacman_hook $apt_hook $hook_script
-    for u in pkg-track-native.path pkg-track-flatpak.path pkg-track-pipx.path pkg-track-snap.path pkg-track-git.path
+    for u in pkg-track-native.path pkg-track-flatpak.path pkg-track-pipx.path pkg-track-snap.path pkg-track-git.path pkg-track-cargo.path pkg-track-npm.path pkg-track-uv.path
         test -f $unit_dir/$u; and systemctl --user disable --now $u 2>/dev/null
         rm -f $unit_dir/$u
     end
@@ -646,6 +700,10 @@ function do_status
     echo "pipx baseline:     "(count (cat $state/pipx.txt 2>/dev/null))" apps"
     echo "snap baseline:     "(count (cat $state/snap.txt 2>/dev/null))" packages"
     echo "git baseline:      "(count (cat $state/git.txt 2>/dev/null))" clones"
+    for m in $xm_list
+        xm_have $m; or continue
+        echo "$m baseline:"(string repeat -n (math max 1, 9 - (string length -- $m)) ' ')(count (cat $state/$m.txt 2>/dev/null))" packages"
+    end
     switch $pm
         case pacman
             test -f $pacman_hook; and echo "pacman hook:       installed"; or echo "pacman hook:       NOT installed (run: install)"
@@ -677,6 +735,14 @@ function do_status
         echo "git watcher:       enabled"
     else
         echo "git watcher:       not enabled"
+    end
+    for m in $xm_list
+        xm_have $m; or continue
+        if systemctl --user is-enabled --quiet pkg-track-$m.path 2>/dev/null
+            echo "$m watcher:"(string repeat -n (math max 1, 10 - (string length -- $m)) ' ')"enabled"
+        else
+            echo "$m watcher:"(string repeat -n (math max 1, 10 - (string length -- $m)) ' ')"not enabled (run: install)"
+        end
     end
     echo "ignore list:       $ignorefile"
     echo

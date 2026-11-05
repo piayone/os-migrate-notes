@@ -3,7 +3,7 @@
 # Copies your LIVE config files back into the notes folder (the parent of the
 # additional-scripts folder this script is in), replacing the old copies there, so the
 # notes always match what you actually use. What is copied is listed in
-# additional-scripts/tracked.conf (add or remove entries with the manager below),
+# additional-scripts/sync-notes-additional-scripts/tracked.conf (add or remove entries with the manager below),
 # Inside the notes everything mirrors your home folder: Backup/<path> holds what is restored
 # on every machine, Desktop Environment/<DE>/<path> the files of one desktop (restored only
 # when that desktop is chosen in initual-setup.sh; the desktops are just those folders).
@@ -15,7 +15,9 @@
 #   ./sync-notes.sh --quiet     do not list every copied file
 #   ./sync-notes.sh --sync      skip the menu and sync (same as the default)
 #   ./sync-notes.sh --backup    skip the menu and make a copy for a USB drive / phone
-#   ./sync-notes.sh --set-repo  set or change the git repo URL (also menu option 3)
+#   ./sync-notes.sh --set-repo  set or change the git repo URL (also menu option 3; it then offers the SSH setup)
+#   ./sync-notes.sh --setup-ssh make an ssh key for the repo, trust the git host, show the public key to add
+#                               to GitHub/GitLab and test the login (a failed push offers it too)
 #   ./sync-notes.sh --manage    open the manager: packages and folders (also menu option 4)
 #   ./sync-notes.sh --set-deletes   choose how deleted files are handled and remember it (also menu option 5)
 #   ./sync-notes.sh --deletes=MODE  use MODE (mirror, archive or keep) for this run only
@@ -107,9 +109,10 @@ else
     set notes $here
 end
 set extras $notes/additional-scripts
+set sn $extras/sync-notes-additional-scripts
 set cfg $HOME/.config
-set pkgfile $extras/packages.conf
-set dirfile $extras/tracked.conf
+set pkgfile $sn/packages.conf
+set dirfile $sn/tracked.conf
 set self (realpath (status filename))
 
 function info;  set_color green;  echo "==> $argv"; set_color normal; end
@@ -135,14 +138,15 @@ if contains -- --yes $argv
 end
 
 # shared helpers (package manager, packages.conf, tracked.conf)
-if test -f $extras/lib.fish
-    source $extras/lib.fish
+if test -f $sn/lib.fish
+    source $sn/lib.fish
     set have_lib 1
     set pm (detect_pm)
 else
     set have_lib 0
     set pm none
-    warn "missing $extras/lib.fish: tracked folders skipped, manager unavailable"
+    warn "missing $sn/lib.fish: tracked folders skipped, manager unavailable"
+    function ssh_git_cmd; echo "ssh -o BatchMode=yes -o ConnectTimeout=15"; end
     function tracked_list; end
     function tracked_name_ok; return 1; end
     set -g layout_backup Backup
@@ -256,9 +260,14 @@ function set_repo_url
         set cur (git -C $notes remote get-url origin 2>/dev/null)
     end
     test -n "$cur"; and echo "current repo: "(mask_url $cur)
+    test -n "$cur"; and echo "  (Enter keeps it and only offers the SSH setup)"
     read -P "Git repo URL (Enter = cancel): " url
     set url (string trim -- $url)
     if test -z "$url"
+        if test -n "$cur"; and test $dry -eq 0
+            repo_ssh_offer $cur
+            return 0
+        end
         warn "no URL entered, nothing changed"
         return 1
     end
@@ -278,6 +287,58 @@ function set_repo_url
     else
         info "not a git repo yet; the next sync offers to set it up"
     end
+    repo_ssh_offer $url
+end
+
+# repo_ssh_setup [URL] : the SSH setup for the notes repo (key, host key, test; see ssh_setup in lib.fish).
+# When the address changes (https -> ssh, or typed just now) the saved URL and origin follow it.
+function repo_ssh_setup
+    type -q ssh_setup; or begin
+        warn "missing $sn/lib.fish: the SSH setup is unavailable"
+        return 1
+    end
+    set -l url $argv[1]
+    if test -z "$url"
+        set url (saved_repo_url)
+        if test -z "$url"; and test -d $notes/.git
+            set url (git -C $notes remote get-url origin 2>/dev/null)
+        end
+    end
+    if test $dry -eq 1
+        info "[dry-run] would set up SSH for the notes repo"
+        return 0
+    end
+
+    # already working? then there is nothing to set up
+    if test -n "$url"; and ssh_parse $url >/dev/null
+        set -lx GIT_SSH_COMMAND (ssh_git_cmd)
+        set -lx GIT_TERMINAL_PROMPT 0
+        if timeout 30 git ls-remote $url HEAD >/dev/null 2>&1
+            info "ssh to the repo already works, nothing to set up"
+            yes_no "Make a new key anyway?" n; or return 0
+        end
+    end
+
+    ssh_setup "$url" $notes
+    set -l st $status
+    if test -n "$ssh_used_url"; and test "$ssh_used_url" != "$url"
+        mkdir -p $repo_cfg; and chmod 700 $repo_cfg
+        printf '%s\n' $ssh_used_url >$repo_url_file; and chmod 600 $repo_url_file
+        test -d $notes/.git; and apply_remote $ssh_used_url
+        info "git: origin -> $ssh_used_url"
+    end
+    return $st
+end
+
+# repo_ssh_offer URL : ask whether to set up SSH now (only in a terminal)
+function repo_ssh_offer
+    is_tty; or return 0
+    test $dry -eq 0; or return 0
+    type -q ssh_setup; or return 0
+    set -l d n
+    ssh_parse $argv[1] >/dev/null; and set d y
+    yes_no "Set up SSH for pushing (a key for this repo, trust the host, test the login)?" $d; or return 0
+    repo_ssh_setup $argv[1]
 end
 
 # ensure_repo : make sure the notes folder is a git repo with an origin.
@@ -465,6 +526,13 @@ function build_pkg_items
     set -g items_header (printf '%-8s %-32s %-34s %s' SOURCE NAME "USED ON THIS SYSTEM" INSTALLED)
     set -g items_noun packages
     set -g items_foot " ($pm system; '-' = no package for it here)"
+    set -l xm_seen
+    for m in $xm_list
+        xm_have $m; or continue
+        for n in (xm_now $m)
+            set -a xm_seen $m:$n
+        end
+    end
     for l in (pkg_lines $pkgfile)
         set -l w (string split ' ' -- $l)
         set -l sec $w[1]
@@ -498,6 +566,8 @@ function build_pkg_items
             test -d (git_dest $name)/.git; and set mark "[x]"
             set -l ins (entry_token install $toks)
             test -n "$ins"; and set here "$here  [runs $ins]"
+        else if contains -- $sec $xm_list
+            contains -- $sec:$name $xm_seen; and set mark "[x]"
         else if pm_installed flatpak $name
             set mark "[x]"
         end
@@ -612,13 +682,14 @@ end
 # offer to install what was just added (new_native / new_flatpak / new_snap / new_pipx / new_git).
 # Packages that are already installed here are left out; when nothing is left, nothing is asked.
 function offer_install
-    set -l added (math (count $new_native) + (count $new_flatpak) + (count $new_snap) + (count $new_pipx) + (count $new_git))
+    set -l added (math (count $new_native) + (count $new_flatpak) + (count $new_snap) + (count $new_pipx) + (count $new_git) + (count $new_xm))
     test $added -gt 0; or return 0
     set -l todo_native
     set -l todo_flatpak
     set -l todo_snap
     set -l todo_pipx
     set -l todo_git
+    set -l todo_xm
     if test $pm != none
         for n in $new_native
             pm_installed $pm $n; or set -a todo_native $n
@@ -636,7 +707,11 @@ function offer_install
     for u in $new_git
         test -d (git_dest $u)/.git; or set -a todo_git $u
     end
-    set -l total (math (count $todo_native) + (count $todo_flatpak) + (count $todo_snap) + (count $todo_pipx) + (count $todo_git))
+    for e in $new_xm
+        set -l m (string split -m1 : -- $e)
+        xm_installed $m[1] $m[2]; or set -a todo_xm $e
+    end
+    set -l total (math (count $todo_native) + (count $todo_flatpak) + (count $todo_snap) + (count $todo_pipx) + (count $todo_git) + (count $todo_xm))
     if test $total -eq 0
         info "already installed on this system, nothing to install"
         return 0
@@ -689,6 +764,14 @@ function offer_install
             warn "git is not installed, only added to the list"
         end
     end
+    for e in $todo_xm
+        set -l m (string split -m1 : -- $e)
+        if xm_have $m[1]
+            xm_install $m[1] $m[2]
+        else
+            warn "$m[1] is not installed, only added to the list"
+        end
+    end
 end
 
 # add_one_name NAME : add one package by name (no install offer), checking that it exists.
@@ -697,6 +780,11 @@ function add_one_name
     set -l name $argv[1]
     if string match -qr '^(https?://|git@|ssh://).+' -- $name
         add_git $name
+        return 0
+    else if string match -qr '^(cargo|npm|uv):.+' -- $name
+        set -l m (string split -m1 : -- $name)
+        xm_have $m[1]; or warn "$m[1] is not installed here, so $m[2] is only added to the list"
+        add_xm $m[1] $m[2]
         return 0
     else if string match -q -- 'pipx:*' $name
         set -l px (string replace -- 'pipx:' '' $name)
@@ -738,6 +826,7 @@ function pkg_add_name
     set -g new_flatpak
     set -g new_snap
     set -g new_pipx
+    set -g new_xm
     set -g new_git
     set -l input "$argv"
     if test -z "$input"
@@ -857,6 +946,7 @@ function pkg_search
     set -g new_flatpak
     set -g new_snap
     set -g new_pipx
+    set -g new_xm
     set -g new_git
     info "searching for '$term'"
     switch $source
@@ -965,6 +1055,12 @@ function pkg_remove
         else if test $items_sec[$i] = pipx
             set src pipx
             set n (pipx_conf_spec $pkgfile $items_key[$i])
+        else if contains -- $items_sec[$i] $xm_list
+            xm_installed $items_sec[$i] $n; and begin
+                set -a inst_src $items_sec[$i]
+                set -a inst_name $n
+            end
+            continue
         end
         test -n "$n"; or continue
         if test $src = snap
@@ -1001,6 +1097,8 @@ function pkg_remove
                     for n in $names
                         sudo snap remove $n
                     end
+                else if contains -- $src $xm_list
+                    xm_remove $src $names
                 else
                     pm_remove $src $names
                 end
@@ -1238,6 +1336,12 @@ function pkg_export
             _cand snap snap $n
         end
     end
+    for m in $xm_list
+        xm_have $m; or continue
+        for n in (xm_now $m)
+            _cand $m $m $n
+        end
+    end
     functions -e _cand
 
     test $hidden -gt 0; and echo "($hidden already in packages.conf are hidden)"
@@ -1254,11 +1358,14 @@ function pkg_export
     set -g new_flatpak
     set -g new_snap
     set -g new_pipx
+    set -g new_xm
     for i in $picked
         if test $items_sec[$i] = flatpak
             add_flatpak $items_key[$i]
         else if test $items_sec[$i] = snap
             add_snap $items_key[$i]
+        else if contains -- $items_sec[$i] $xm_list
+            add_xm $items_sec[$i] $items_key[$i]
         else if test $items_sec[$i] = pipx
             add_pipx $items_key[$i]
             # an app that is not on PyPI: offer a name for it
@@ -1276,7 +1383,7 @@ end
 
 function pkg_install
     ensure_pkgfile
-    # install_packages handles every section: native, flatpak, snap, pipx and git
+    # install_packages handles every section: native, flatpak, snap, pipx, git, cargo, npm and uv
     install_packages $pkgfile
 end
 
@@ -1449,6 +1556,17 @@ function tree_walk
         for e in $gi_excl
             string match -q -- "*/$e" "$dir/$x"; and set skip 1
         end
+        # tree_hide=1 (the .gitignore editor): leave out .git, image/video/audio files and
+        # everything git already ignores, so only what is still tracked is listed
+        if test $skip -eq 0; and test "$tree_hide" = 1
+            if test "$x" = .git
+                set skip 1
+            else if test -f "$dir/$x"; and string match -qri '\.(png|jpe?g|gif|webp|bmp|svg|ico|tiff?|heic|avif|mp4|mkv|webm|mov|avi|flv|wmv|m4v|mpe?g|3gp|ogv|ts|vob|mp3|flac|wav|ogg|oga|opus|m4a|aac|wma|aiff?|ape|mka|midi?)$' -- $x
+                set skip 1
+            else if test -d $notes/.git; and git -C $notes check-ignore -q -- (string replace -- "$notes/" '' "$dir/$x")
+                set skip 1
+            end
+        end
         test $skip -eq 0; and set -a items $x
     end
     set -l n (count $items)
@@ -1478,6 +1596,8 @@ function tree_walk
             set_color normal
             if test "$it" = .git
                 echo "  (not opened)"
+            else if test "$tree_hide" = 1; and string match -q -- "*/Desktop Environment/mango/*" $full; and string match -qr -- '/scripts/(playlists|wallpaperengine-setup/wpe-settings)$' $full
+                echo "  (contents hidden)"
             else
                 echo
                 tree_walk $full "$prefix$pad"
@@ -2382,6 +2502,22 @@ function exclude_check
     return 0
 end
 
+# looks_secret PATH : prints "." if PATH itself looks secret, otherwise each secret-looking entry inside it
+function looks_secret
+    set -l p $argv[1]
+    set -l re '(\.kdbx?$|\.(pem|key|p12|pfx|gpg|asc|enc|age|jks|keystore|ovpn)$|(^|/)\.(passwords?|gnupg|ssh|aws|netrc|pgpass|env(\..*)?)(/|$)|(^|/)id_(rsa|ed25519|ecdsa|dsa)(\.pub)?$|recovery-codes|secrets?|credentials?|tokens?|passwords?|\.master$)'
+    if string match -qir -- $re (basename $p)
+        echo .
+        return
+    end
+    test -d $p -a ! -L $p; or return
+    for f in (find $p -maxdepth 4 2>/dev/null)
+        set -l rel (string replace -- "$p/" '' $f)
+        test "$rel" = "$f"; and continue
+        string match -qir -- $re $rel; and echo $rel
+    end
+end
+
 function dir_add
     set -g gi_xf
     set -g gi_excl
@@ -2530,11 +2666,36 @@ function dir_add
         echo "  They are in: "(string replace -- "$HOME/" '~/' $notes)"/$layout_de/$picked_de/"
     end
 
+    # secret-looking content: git is told to ignore it automatically (the copy in the notes stays)
+    set -l hits
+    for h in (looks_secret $p)
+        set -l covered 0
+        for k in $hits
+            string match -q -- "$k/*" $h; and set covered 1
+        end
+        test $covered -eq 0; and set -a hits $h
+    end
+    if test (count $hits) -gt 0
+        warn "secret-looking content found, git will ignore it (still copied into the notes):"
+        for h in $hits
+            set -l rel $name
+            set -l src $p
+            if test "$h" != .
+                set rel "$name/$h"
+                set src "$p/$h"
+            end
+            set -l ig "/"(gi_esc $rel)
+            test -d $src -a ! -L $src; and set ig "$ig/"
+            printf '    %s\n' $ig
+            gitignore_add $ig
+            test -d $notes/.git; and git -C $notes rm -r -q --cached --ignore-unmatch -- $rel 2>/dev/null
+        end
+    end
     # keep it out of git? (separate from "secrets": the files are still copied into the
     # notes folder and the USB backup copy, git just never sees them)
     set -l gi_default n
     contains -- private $opts; and set gi_default y
-    if yes_no "Keep (part of) it out of git? (it is still copied into the notes)" $gi_default
+    if test (count $hits) -eq 0; and yes_no "Keep (part of) it out of git? (it is still copied into the notes)" $gi_default
         if test -d $p -a ! -L $p
             # a folder: ask whether only some types / files / folders should be left out
             set -l exs
@@ -2553,7 +2714,7 @@ function dir_add
                 info "git: stopped tracking $name (the next sync commits that)"
             end
         end
-    else
+    else if test (count $hits) -eq 0
         # git may track everything: drop rules left by an earlier run for this path
         gitignore_drop_folder $name
     end
@@ -3397,6 +3558,7 @@ function pkg_list_menu
     set -g new_flatpak
     set -g new_snap
     set -g new_pipx
+    set -g new_xm
     set -g new_git
     for i in $picked
         if test "$items_inst[$i]" = "-"
@@ -3504,6 +3666,7 @@ function dir_menu
         echo "  6) Rename directories or files"
         echo "  7) Choose what is NOT copied into the notes"
         echo "  8) Choose what git does NOT track"
+        echo "  9) Edit .gitignore (add or remove rules)"
         echo "  0) Back"
         ask "Choose: "; or return 0
         switch $reply
@@ -3528,6 +3691,8 @@ function dir_menu
                 exclude_menu
             case 8
                 git_menu
+            case 9
+                gi_menu
             case 0 ''
                 return 0
         end
@@ -3784,6 +3949,190 @@ function git_menu
     end
 end
 
+# ---------------------------------------------------------------- edit .gitignore of the notes folder
+# gi_menu : add rules to / remove rules from $notes/.gitignore
+function gi_menu
+    while true
+        echo
+        set_color --bold
+        echo ".gitignore of the notes folder"
+        set_color normal
+        echo "  1) Add: choose files/directories git should NOT track"
+        echo "  2) Remove: choose rules to delete (git tracks those again)"
+        echo "  0) Back"
+        ask "Choose: "; or return 0
+        switch $reply
+            case 1
+                gi_add_notes
+            case 2
+                gi_remove_notes
+            case 0 ''
+                return 0
+        end
+    end
+end
+
+# gi_add_notes : show the notes tree (no images/videos/audio, nothing already ignored), ask what to
+# leave out of git, understand the words like the per-folder flow does, then write the rules
+function gi_add_notes
+    set -l p $notes
+    set -g gi_excl
+    set -g gi_xf
+    set -l lines
+    set -l plan
+    while true
+        set lines
+        set plan
+        set -g tree_hide 1
+        tree_show $p
+        set -g tree_hide 0
+        echo "  (not shown: .git, paths already in .gitignore, image/video/audio files)"
+        echo
+        echo "Choose files/directories to get EXCLUDED from git"
+        echo "  Separate with spaces or commas. Use 'quotes' for names with spaces."
+        echo "    png mp4      every file of that type, in all folders"
+        echo "    cache.db     a file or folder with that name (searched everywhere)"
+        echo "    logs/*.log   a path inside the notes folder"
+        ask "EXCLUDE (names, *.ext or paths; Enter or q = cancel): "; or return 1
+        test -n "$reply"; or return 1
+        test "$reply" = q; and return 1
+
+        for t in (gi_split $reply $p)
+            set t (string trim -c "'\"" -- (string trim -- $t))
+            test -n "$t"; or continue
+            set -l rel (gi_rel $p $t); or begin
+                warn "'$t' is not inside the notes folder, skipped"
+                continue
+            end
+            set -l bpart (string replace -r -- '^.*/' '' $rel)
+            set -l dpart ""
+            string match -q '*/*' -- $rel; and set dpart (string replace -r -- '/[^/]*$' '' $rel)
+
+            # a bare word (png, .png) is a file type when nothing has exactly that name
+            set -l ext ""
+            if string match -qr -- '^\.?[A-Za-z0-9]+$' $rel
+                set -l w (string replace -r -- '^\.' '' $rel)
+                set -l nm (gi_find $p $rel exact | count)
+                set -l ec (gi_ext_hits $p $w | count)
+                if test $nm -eq 0 -a $ec -gt 0
+                    set ext $w
+                else if test $nm -gt 0 -a $ec -gt 0
+                    echo
+                    echo "'$rel' is the name of $nm file/folder(s) and also the type of $ec file(s) (*.$w)."
+                    ask "  n = the name(s), t = the *.$w files (Enter = n): "; or return 1
+                    test (string lower -- "$reply") = t; and set ext $w
+                end
+            end
+
+            if test -n "$ext"
+                set -l ln "*.$ext"
+                contains -- $ln $lines; or set -a lines $ln
+                set -a plan (printf '  %-14s every *.%s in all folders  (%s file(s))' $t $ext (gi_ext_hits $p $ext | count))
+            else if string match -qr '[*?\[]' -- $bpart
+                if string match -qr '[*?\[]' -- $dpart
+                    warn "'$t': wildcards work only in the file part (like logs/*.log), skipped"
+                    continue
+                end
+                set -l n 0
+                set -l ln $bpart
+                if test -n "$dpart"
+                    test -d $p/$dpart; or warn "'$t': there is no folder '$dpart' yet, the rule is added anyway"
+                    set ln "/"(gi_esc $dpart)"/$bpart"
+                    set n (find $p/$dpart -maxdepth 1 \( -type f -o -type l \) -name $bpart 2>/dev/null | count)
+                else
+                    set n (find $p -not -path '*/.git/*' \( -type f -o -type l \) -name $bpart | count)
+                end
+                contains -- $ln $lines; or set -a lines $ln
+                set -a plan (printf '  %-14s %s  (%s file(s))' $t $ln $n)
+            else
+                gi_resolve $p $t $rel; or continue
+                for r in $gi_picked
+                    set -l ln "/"(gi_esc $r)
+                    if test -d $p/$r -a ! -L $p/$r
+                        set ln "$ln/"
+                        set -a plan (printf '  %-14s folder %s/  (%s file(s))' $t $r (find $p/$r -type f | count))
+                    else
+                        set -a plan (printf '  %-14s file   %s' $t $r)
+                    end
+                    contains -- $ln $lines; or set -a lines $ln
+                end
+            end
+        end
+
+        if test (count $lines) -eq 0
+            warn "nothing to add to .gitignore"
+            continue
+        end
+        echo
+        echo "What you typed was understood as:"
+        printf '%s\n' $plan
+        echo
+        echo "Rules to write:"
+        printf '    %s\n' $lines
+        yes_no "Write these rules to .gitignore?" y; and break
+        echo "  ok, type it again"
+    end
+
+    for ln in $lines
+        gitignore_add $ln
+    end
+    echo
+    info "written to $notes/.gitignore"
+
+    # files committed earlier that now match: stop tracking them (they stay on disk)
+    if test -d $notes/.git
+        set -l nt (git -C $notes ls-files -ci --exclude-standard | count)
+        if test $nt -gt 0
+            git -C $notes ls-files -z -ci --exclude-standard | xargs -0 -r git -C $notes rm -q --cached --
+            info "git: stopped tracking $nt file(s) that now match (the next sync commits that)"
+        end
+    end
+    return 0
+end
+
+# gi_remove_notes : list the rules of .gitignore, pick the ones to delete
+function gi_remove_notes
+    set -l gi $notes/.gitignore
+    if not test -f $gi
+        warn "there is no .gitignore yet"
+        return 0
+    end
+    while true
+        set -l rules
+        for l in (cat $gi)
+            set -l b (string trim -- $l)
+            test -n "$b"; or continue
+            string match -q -- '#*' $b; and continue
+            contains -- $l $rules; or set -a rules $l
+        end
+        if test (count $rules) -eq 0
+            info "there are no rules in .gitignore"
+            return 0
+        end
+        set -g items_key $rules
+        set -g items_alt
+        set -g items_label $rules
+        set -g items_sec
+        set -g items_toks
+        set -g items_name
+        set -g items_inst
+        set -g items_header ""
+        set -g items_noun rules
+        set -g items_foot " in .gitignore"
+        pick_items "Remove which rules"; or return 0
+        set -l gone $items_key[$picked]
+        echo
+        echo "These rules will be removed (git tracks what they covered again):"
+        printf '    %s\n' $gone
+        if yes_no "Remove them?" y
+            for l in $gone
+                gitignore_remove $l
+            end
+            info "removed "(count $gone)" rule(s) from .gitignore"
+        end
+    end
+end
+
 function main_menu
     while true
         echo
@@ -3810,11 +4159,11 @@ end
 # the safety net, so a sync or opening the package manager never works with an outdated list.
 function track_now
     test $dry -eq 0; or return 0
-    test -f $extras/pkg-track.fish; or return 0
+    test -f $sn/pkg-track.fish; or return 0
     if is_tty
-        fish $extras/pkg-track.fish update
+        fish $sn/pkg-track.fish update
     else
-        fish $extras/pkg-track.fish update </dev/null >/dev/null 2>&1
+        fish $sn/pkg-track.fish update </dev/null >/dev/null 2>&1
     end
     return 0
 end
@@ -3822,7 +4171,7 @@ end
 # need_lib : the manager needs lib.fish (package manager helpers, packages.conf, tracked.conf)
 function need_lib
     test $have_lib -eq 1; and return 0
-    warn "missing $extras/lib.fish: the package and folder manager needs it"
+    warn "missing $sn/lib.fish: the package and folder manager needs it"
     return 1
 end
 
@@ -4035,6 +4384,8 @@ end
 set mode sync
 if contains -- --set-repo $argv
     set mode repo
+else if contains -- --setup-ssh $argv
+    set mode ssh
 else if contains -- --migrate $argv
     set mode migrate
 else if contains -- --manage $argv
@@ -4049,7 +4400,7 @@ else if not contains -- --sync $argv; and not string match -q -- '--deletes=*' $
         set_color --bold; echo "What do you want to do?"; set_color normal
         echo "  1) Sync notes + git backup   (default)"
         echo "  2) Back up to Documents/os-migrate-notes-backup"
-        echo "  3) Set or change the git repo URL"
+        echo "  3) Set or change the git repo URL (and set up SSH for it)"
         echo "  4) Manage packages and backed-up folders"
         echo "  5) Choose how deleted files are handled   (now: $delmode)"
         set maxopt 5
@@ -4092,6 +4443,14 @@ if test $mode = repo
     set rstatus $status
     info "done."
     exit $rstatus
+end
+
+if test $mode = ssh
+    need_lib; or exit 1
+    repo_ssh_setup
+    set sstatus $status
+    info "done."
+    exit $sstatus
 end
 
 if test $mode = deletes
@@ -4248,7 +4607,7 @@ function pull
 end
 
 # ---------------------------------------------------------------- tracked folders
-# Everything listed in additional-scripts/tracked.conf (config.fish, ghostty, Keypass,
+# Everything listed in additional-scripts/sync-notes-additional-scripts/tracked.conf (config.fish, ghostty, Keypass,
 # .passwords, Music ... and whatever you add with the manager), each saved as Backup/<path>
 # or Desktop Environment/<DE>/<path>.
 test $quiet -eq 0 -a $delmode != archive; and info "deleted files: $delmode mode"
@@ -4258,7 +4617,7 @@ if test $dry -eq 0
     sweep_leftovers
 end
 test $old_layout -gt 0; and warn "tracked.conf still has $old_layout entries in the old layout, they are skipped: run  sync-notes.sh --migrate"
-for line in (tracked_list $extras/tracked.conf)
+for line in (tracked_list $sn/tracked.conf)
     set p (string split \t -- $line)
     set live $p[1]
     set name $p[2]
@@ -4301,6 +4660,51 @@ for line in (tracked_list $extras/tracked.conf)
 end
 
 # ---------------------------------------------------------------- git backup
+# git_push_once BRANCH ERRFILE : push; if the remote has commits we lack, put ours on top and push again.
+# The errors go to ERRFILE (not thrown away), so the warning can say what really went wrong.
+function git_push_once
+    set -l branch $argv[1]
+    set -l gerr $argv[2]
+    : >$gerr
+    set -lx GIT_SSH_COMMAND (ssh_git_cmd)
+    set -lx GIT_TERMINAL_PROMPT 0
+    timeout 90 git -C $notes push -q -u origin $branch 2>>$gerr; and return 0
+    # not reachable or not allowed in: rebasing would only fail the same way
+    git_failure_is_ssh $gerr; and return 1
+    grep -qiE 'Could not resolve|timed out|Network is unreachable|No route to host|Connection refused' $gerr; and return 1
+    if timeout 90 git -C $notes pull -q --rebase origin $branch 2>>$gerr
+        timeout 90 git -C $notes push -q -u origin $branch 2>>$gerr; and return 0
+        return 1
+    end
+    git -C $notes rebase --abort 2>/dev/null
+    return 1
+end
+
+# git_failure_is_ssh ERRFILE : was it the host key or the ssh key?
+function git_failure_is_ssh
+    grep -qiE 'Host key verification failed|Permission denied \(publickey|Permission denied, please try again|no matching host key' $argv[1]
+end
+
+# git_explain_failure ERRFILE : say what went wrong in plain words
+function git_explain_failure
+    set -l f $argv[1]
+    if grep -qi 'Host key verification failed' $f
+        warn "git push skipped: this machine does not trust the git host's SSH key yet (it is not in ~/.ssh/known_hosts)"
+        warn "fix: ./sync-notes.sh --setup-ssh"
+    else if grep -qiE 'Permission denied \(publickey|Permission denied, please try again' $f
+        warn "git push skipped: the git host refused the SSH key (no key for it, the key is not added to the account, or it needs a passphrase)"
+        warn "fix: ./sync-notes.sh --setup-ssh"
+    else if grep -qiE 'Could not resolve|timed out|Network is unreachable|No route to host|Connection refused' $f
+        warn "git push skipped: cannot reach the remote (offline?)"
+    else if grep -qiE 'could not apply|CONFLICT|non-fast-forward|\[rejected\]|fetch first|unrelated histories|refusing to merge' $f
+        warn "git push skipped: the remote has history this copy does not (a conflict, or a repo made separately)"
+        warn "look: git -C $notes fetch origin; git -C $notes log --oneline --graph --all"
+    else
+        warn "git push failed:"
+        tail -n 6 $f | string replace -r '^' '    '
+    end
+end
+
 # Commits whatever changed and pushes it to origin. Works from the systemd timer too:
 # ssh runs in batch mode (never waits for a password), so the key must work without a
 # prompt (no passphrase, or an ssh-agent the service can reach). Failures only print a
@@ -4337,22 +4741,22 @@ function git_backup
     end
 
     set branch (git -C $notes rev-parse --abbrev-ref HEAD)
-    set -lx GIT_SSH_COMMAND "ssh -o BatchMode=yes -o ConnectTimeout=15"
-    set -lx GIT_TERMINAL_PROMPT 0
-
-    if not timeout 90 git -C $notes push -q -u origin $branch 2>/dev/null
-        # the remote has commits we don't: put ours on top of them and try once more
-        if timeout 90 git -C $notes pull -q --rebase origin $branch 2>/dev/null
-            if not timeout 90 git -C $notes push -q -u origin $branch 2>/dev/null
-                warn "git push failed after rebase"
-                return 1
+    set -l gerr (mktemp)
+    set -l tries 0
+    while true
+        set tries (math $tries + 1)
+        git_push_once $branch $gerr; and break
+        git_explain_failure $gerr
+        # a key or host key problem, in a terminal: offer to fix it, then push once more
+        if test $tries -eq 1; and is_tty; and git_failure_is_ssh $gerr; and type -q ssh_setup
+            if yes_no "Set up SSH now (key, host key, test) and push again?" y
+                repo_ssh_setup (git -C $notes remote get-url origin 2>/dev/null); and continue
             end
-        else
-            git -C $notes rebase --abort 2>/dev/null
-            warn "git push skipped: offline, no ssh access, or a conflict with the remote"
-            return 1
         end
+        rm -f $gerr
+        return 1
     end
+    rm -f $gerr
     info "git: pushed to origin/$branch"
 end
 

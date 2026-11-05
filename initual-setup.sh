@@ -25,11 +25,15 @@
 #
 # Order: questions -> packages + GRUB -> update -> copy config files (last, so
 # the packages cannot overwrite your configs with their defaults) -> venvs for any
-# requirements.txt (asked) -> enable the hourly sync-notes.sh
+# requirements.txt (asked) -> SSH for the notes repo (asked) -> enable the hourly sync-notes.sh
 # timer (needs additional-scripts/sync-notes.sh in the notes).
 #
-# What gets installed:  additional-scripts/packages.conf  (edit with sync-notes.sh, menu option 4)
-# What gets restored:   additional-scripts/tracked.conf   (edit with sync-notes.sh, menu option 4)
+# SSH (asked, in a terminal): makes an ssh key just for the notes repo, trusts the git host, shows the
+# public key to add to GitHub/GitLab and tests the login, so the hourly sync can push. Run it again
+# later with: additional-scripts/sync-notes.sh --setup-ssh
+#
+# What gets installed:  additional-scripts/sync-notes-additional-scripts/packages.conf  (edit with sync-notes.sh, menu option 4)
+# What gets restored:   additional-scripts/sync-notes-additional-scripts/tracked.conf   (edit with sync-notes.sh, menu option 4)
 #                       notes made by an older version are moved to this layout first (sync-notes.sh --migrate)
 #
 # Shared things: rofi and the like stay in Backup/ and are not moved into one desktop. Which desktops
@@ -54,24 +58,25 @@ else
     set notes $here
 end
 set extras $notes/additional-scripts
+set sn $extras/sync-notes-additional-scripts
 set cfg $HOME/.config
 
 function info;  set_color green;  echo "==> $argv"; set_color normal; end
 function warn;  set_color yellow; echo "!!  $argv"; set_color normal; end
 
 # shared helpers: package manager detection, packages.conf, tracked.conf
-if not test -f $extras/lib.fish
-    warn "missing $extras/lib.fish (it belongs next to the other scripts in additional-scripts/)"
+if not test -f $sn/lib.fish
+    warn "missing $sn/lib.fish (it belongs next to the other scripts in additional-scripts/)"
     exit 1
 end
-source $extras/lib.fish
+source $sn/lib.fish
 set pm (detect_pm)
 info "package manager: $pm"
 
 # notes made by an older version (folders at the top level, de=NAME tags): move them to the
 # Backup / Desktop Environment layout first, the rest of this script expects it
 set old_n 0
-for line in (tracked_list $extras/tracked.conf)
+for line in (tracked_list $sn/tracked.conf)
     set p (string split \t -- $line)
     tracked_name_ok $p[2]; or set old_n (math $old_n + 1)
 end
@@ -409,14 +414,16 @@ end
 # everything in packages.conf: native packages with the detected package manager, flatpak apps
 # with flatpak. Names this distro does not have are skipped and listed at the end.
 info "installing the packages from packages.conf"
-install_packages $extras/packages.conf
+install_packages $sn/packages.conf
 
 # ---------------------------------------------------------------- ufw (KDE Connect, LocalSend, AudioRelay)
 if type -q ufw
     info "opening ports (KDE Connect, LocalSend, AudioRelay)"
-    sudo ufw allow 1716/udp      # KDE Connect
+    sudo ufw allow 1714:1764/udp # KDE Connect
+    sudo ufw allow 1714:1765/tcp # KDE Connect
     sudo ufw allow 5000/tcp      # LocalSend
     sudo ufw allow 53317/tcp     # LocalSend
+    sudo ufw allow 53317/udp     # LocalSend
     sudo ufw allow 1234/tcp      # AudioRelay
     sudo ufw allow 59100/tcp     # AudioRelay
     sudo ufw allow 59100/udp     # AudioRelay
@@ -485,13 +492,13 @@ end
 # ================================================================
 
 # ---------------------------------------------------------------- tracked folders
-# Everything listed in additional-scripts/tracked.conf: config.fish, ghostty, Keypass,
+# Everything listed in additional-scripts/sync-notes-additional-scripts/tracked.conf: config.fish, ghostty, Keypass,
 # .passwords, the Music scripts, clean.py ... (saved in Backup/) and the files of your desktop
 # environment (saved in Desktop Environment/NAME/), plus whatever you added with sync-notes.sh
 # (menu option 4). Both places hold the same paths as your home folder.
 set sys_names
 set sys_opts
-for line in (tracked_list $extras/tracked.conf)
+for line in (tracked_list $sn/tracked.conf)
     set p (string split \t -- $line)
     set live $p[1]
     set name $p[2]
@@ -555,7 +562,7 @@ end
 # Any requirements.txt in what was just restored (the tracked folders) or in a cloned repo of
 # packages.conf: ask, one by one, whether to build a venv (.venv next to it) for it.
 set req_files
-for line in (tracked_list $extras/tracked.conf)
+for line in (tracked_list $sn/tracked.conf)
     set p (string split \t -- $line)
     set -q p[2]; tracked_name_ok $p[2]; or continue
     set -q p[3]; and set o (string split -n ' ' -- $p[3]); or set o
@@ -566,7 +573,7 @@ for line in (tracked_list $extras/tracked.conf)
         contains -- $f $req_files; or set -a req_files $f
     end
 end
-for u in (git_repos_conf $extras/packages.conf)
+for u in (git_repos_conf $sn/packages.conf)
     set d (git_dest $u)
     test -d $d; or continue
     for f in (find $d -maxdepth 2 -name requirements.txt -not -path '*/.venv/*' -not -path '*/.git/*' 2>/dev/null)
@@ -663,20 +670,64 @@ else
     end
 end
 
+# ---------------------------------------------------------------- ssh for the notes repo
+# The hourly sync pushes the notes to git without ever asking for a password, so it needs an ssh key
+# that works on its own. This makes one for the notes repo, trusts the git host, shows the public key
+# to add to your account, and tests the login. Needs a terminal; skipped otherwise.
+if isatty stdin; and test -d $notes_dst
+    echo
+    set_color --bold; echo "Set up SSH for pushing the notes to git?"; set_color normal
+    echo "  What it does: makes an ssh key for the notes repo, trusts the git host (you see its fingerprint"
+    echo "                first), shows you the public key to add to GitHub/GitLab, and tests the login."
+    echo "  Why:          the hourly sync pushes with no password prompt, so it needs a key that works alone."
+    echo "  You can skip it and run it later: additional-scripts/sync-notes.sh --setup-ssh"
+    read -P "Set up SSH now? [y/N]: " ssh_ans
+    if string match -qri '^y' -- (string trim -- "$ssh_ans")
+        # the repo's address: origin of the notes, else the one saved outside the notes
+        set ssh_url ""
+        if test -d $notes_dst/.git
+            set ssh_url (git -C $notes_dst remote get-url origin 2>/dev/null)
+        end
+        if test -z "$ssh_url"; and test -f $cfg_dir/git-url
+            set ssh_url (string trim -- (head -n1 $cfg_dir/git-url))
+        end
+        if ssh_setup "$ssh_url" $notes_dst
+            info "ssh works"
+        else
+            warn "SSH is not working yet. Run it again later: $notes_dst/additional-scripts/sync-notes.sh --setup-ssh"
+        end
+        # a new address (typed here, or https turned into ssh): remember it and point origin at it
+        if test -n "$ssh_used_url"; and test "$ssh_used_url" != "$ssh_url"
+            mkdir -p $cfg_dir; and chmod 700 $cfg_dir
+            printf '%s\n' $ssh_used_url >$cfg_dir/git-url; and chmod 600 $cfg_dir/git-url
+            if test -d $notes_dst/.git
+                if git -C $notes_dst remote get-url origin >/dev/null 2>&1
+                    git -C $notes_dst remote set-url origin $ssh_used_url
+                else
+                    git -C $notes_dst remote add origin $ssh_used_url
+                end
+                info "git: origin -> $ssh_used_url"
+            else
+                info "repo address saved; the first sync sets up git with it"
+            end
+        end
+    end
+end
+
 # ---------------------------------------------------------------- auto-sync timer
 # sync-notes.sh copies the live configs back into ~/Documents/os-migrate-notes. It runs from a systemd
 # user timer (3 min after login, then hourly). This is enabled LAST, after every config has
 # been restored above, so the sync can never overwrite your notes with fresh-install defaults.
 set sync_dst $notes_dst/additional-scripts
+set sn_dst $sync_dst/sync-notes-additional-scripts
 if test -f $extras/sync-notes.sh
     if test (realpath $notes_dst) != $notes
-        mkdir -p $sync_dst
-        for f in sync-notes.sh lib.fish
-            test -f $extras/$f; and cp -a $extras/$f $sync_dst/$f
-        end
-        # the two lists are only copied when missing, so an existing one is never overwritten
+        mkdir -p $sync_dst $sn_dst
+        cp -a $extras/sync-notes.sh $sync_dst/sync-notes.sh
+        test -f $sn/lib.fish; and cp -a $sn/lib.fish $sn_dst/lib.fish
+        # the lists are only copied when missing, so an existing one is never overwritten
         for f in tracked.conf packages.conf pkg-ignore.conf
-            test -f $extras/$f; and cp -an $extras/$f $sync_dst/$f
+            test -f $sn/$f; and cp -an $sn/$f $sn_dst/$f
         end
         info "$extras/ tools -> $sync_dst/"
     end
@@ -709,20 +760,20 @@ end
 # working if this folder is moved or deleted.
 if test $no_pkg_track -eq 1
     info "package tracker skipped (--no-pkg-track)"
-else if not test -f $extras/pkg-track.fish
-    warn "pkg-track.fish not found in $extras, package tracker skipped"
+else if not test -f $sn/pkg-track.fish
+    warn "pkg-track.fish not found in $sn, package tracker skipped"
 else
-    set pt_dir $extras
+    set pt_dir $sn
     if test (realpath $notes_dst) != $notes
-        mkdir -p $sync_dst
+        mkdir -p $sn_dst
         for f in pkg-track.fish lib.fish
-            test -f $extras/$f; and cp -a $extras/$f $sync_dst/$f
+            test -f $sn/$f; and cp -a $sn/$f $sn_dst/$f
         end
         # the lists are only copied when missing, so an existing one is never overwritten
         for f in packages.conf pkg-ignore.conf
-            test -f $extras/$f; and cp -an $extras/$f $sync_dst/$f
+            test -f $sn/$f; and cp -an $sn/$f $sn_dst/$f
         end
-        set pt_dir $sync_dst
+        set pt_dir $sn_dst
     end
     info "installing the package tracker (needs sudo for the pacman/apt hook)"
     fish $pt_dir/pkg-track.fish install; or warn "package tracker setup failed, run later: fish $pt_dir/pkg-track.fish install"
